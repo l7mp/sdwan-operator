@@ -4,7 +4,7 @@ go 1.23.4
 
 require (
 	github.com/go-logr/logr v1.4.2
-	github.com/hsnlab/dcontroller v0.0.0-20250227180858-cf22c4e6b58c
+	github.com/hsnlab/dcontroller v0.0.0-20250303191128-ec7488469e59
 	go.uber.org/zap v1.26.0
 	k8s.io/apimachinery v0.32.2
 	k8s.io/client-go v0.32.2
@@ -29,6 +29,9 @@ require (
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/grokify/base36 v1.0.5 // indirect
+	github.com/grokify/mogo v0.68.1 // indirect
+	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
