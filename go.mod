@@ -4,7 +4,7 @@ go 1.23.4
 
 require (
 	github.com/go-logr/logr v1.4.2
-	github.com/hsnlab/dcontroller v0.0.0-20250303191128-ec7488469e59
+	github.com/hsnlab/dcontroller v0.0.0-20250306202812-3481892a9f86
 	go.uber.org/zap v1.26.0
 	k8s.io/apimachinery v0.32.2
 	k8s.io/client-go v0.32.2

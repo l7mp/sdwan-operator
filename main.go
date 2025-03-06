@@ -32,6 +32,7 @@ import (
 
 const (
 	SDWANOperatorSpec               = "artifacts/endpoints-controller-spec.yaml"
+	SDWANOperatorGatherSpec         = "artifacts/endpoints-controller-gather-spec.yaml"
 	SDWANPolicyTunnelAnnotationName = "policy.sdwan.cisco.com/tunnel"
 )
 
@@ -42,6 +43,9 @@ func init() {
 }
 
 func main() {
+	gatherEndpoints := flag.Bool("gather-endpoints", false,
+		"Generate a single object per service with all endpoints.")
+
 	zapOpts := zap.Options{
 		Development:     true,
 		DestWriter:      os.Stderr,
@@ -54,6 +58,11 @@ func main() {
 	logger := zap.New(zap.UseFlagOptions(&zapOpts))
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
+
+	specFile := SDWANOperatorSpec
+	if *gatherEndpoints {
+		specFile = SDWANOperatorGatherSpec
+	}
 
 	// Create a dmanager
 	mgr, err := dmanager.New(ctrl.GetConfigOrDie(), dmanager.Options{
@@ -71,7 +80,7 @@ func main() {
 		Logger:       logger,
 	}
 
-	if _, err := doperator.NewFromFile("sdwan-operator", mgr, SDWANOperatorSpec, opts); err != nil {
+	if _, err := doperator.NewFromFile("sdwan-operator", mgr, specFile, opts); err != nil {
 		log.Error(err, "unable to create pod autoscaler operator")
 		os.Exit(1)
 	}
@@ -146,7 +155,7 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 	// vManage update
 	switch req.EventType {
-	case cache.Added, cache.Updated:
+	case cache.Added, cache.Updated, cache.Upserted:
 		obj := dobject.NewViewObject(req.GVK.Kind)
 		if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj); err != nil {
 			r.log.Error(err, "failed to get added/updated object", "delta-type", req.EventType)
@@ -161,8 +170,10 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 		r.log.Info("Add/update SD-WAN tunnel policy", "name", obj.GetName(), "namespace", obj.GetNamespace(),
 			"spec", fmt.Sprintf("%#v", spec))
+
 	case cache.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
+
 	default:
 		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace,
 			"type", req.EventType)
