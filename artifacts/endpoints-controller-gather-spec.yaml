@@ -62,7 +62,7 @@ controllers:
             spec: $.ServiceView.spec
             endpoints: $.EndpointSlice.endpoints
             id:
-              name: $.ServiceView.spec.serviceNname
+              name: $.ServiceView.spec.serviceName
               namespace: $.ServiceView.metadata.namespace
               type: $.ServiceView.spec.type
               protocol: $.ServiceView.spec.protocol
@@ -80,6 +80,12 @@ controllers:
               - {metadata: $.metadata}
               - {spec: $.spec}
               - {"$.spec.addresses": $.endpoints.addresses}
-              - {"$.metadata.name": $.spec.serviceName}
+              - "$.metadata.name":
+                  "@concat":
+                    - $.spec.serviceName
+                    - "-"
+                    - $.spec.protocol
+                    - "-"
+                    - $.spec.port
     target:
       kind: TunnelPolicyView
