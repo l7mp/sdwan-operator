@@ -104,10 +104,10 @@ func (m *Manager) HandleDeleteEvent(namespace, name string) error {
 	//nolint:errcheck
 	m.deactivateCentralPolicy()
 
-	// dataprefix
-	id, ok := m.objectCache["dataprefix"][objName]
+	// approute
+	id, ok := m.objectCache["approute"][objName]
 	if ok {
-		endpoint := "/template/policy/list/dataprefix/" + id
+		endpoint := "/template/policy/definition/approute/" + id
 		res, err := m.client.Delete(endpoint)
 		if err != nil {
 			return err
@@ -115,10 +115,10 @@ func (m *Manager) HandleDeleteEvent(namespace, name string) error {
 		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
 	}
 
-	// approute
-	id, ok = m.objectCache["approute"][objName]
+	// dataprefix
+	id, ok = m.objectCache["dataprefix"][objName]
 	if ok {
-		endpoint := "/template/policy/definition/approute/" + id
+		endpoint := "/template/policy/list/dataprefix/" + id
 		res, err := m.client.Delete(endpoint)
 		if err != nil {
 			return err
@@ -183,7 +183,7 @@ func (m *Manager) upsertDataPrefixList(objName string, endpoints []string) error
 			m.log.Error(err, fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
 			return err
 		}
-		m.objectCache["dataprefix"][objName] = res.Get("definitionId").String()
+		m.objectCache["dataprefix"][objName] = res.Get("listId").String()
 		m.log.Info(fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
 	}
 
