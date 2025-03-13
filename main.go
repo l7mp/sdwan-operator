@@ -1,8 +1,8 @@
-// A simplified vertical pod autoscaler implementation.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -28,12 +28,15 @@ import (
 	dobject "github.com/hsnlab/dcontroller/pkg/object"
 	doperator "github.com/hsnlab/dcontroller/pkg/operator"
 	dreconciler "github.com/hsnlab/dcontroller/pkg/reconciler"
+
+	"github.com/l7mp/sdwan-operator/internal/sdwan"
 )
 
 const (
 	SDWANOperatorSpec               = "artifacts/endpoints-controller-spec.yaml"
 	SDWANOperatorGatherSpec         = "artifacts/endpoints-controller-gather-spec.yaml"
 	SDWANPolicyTunnelAnnotationName = "policy.sdwan.cisco.com/tunnel"
+	SDWANConfigFile                 = "vmanage-config.yaml"
 )
 
 var scheme = runtime.NewScheme()
@@ -43,8 +46,8 @@ func init() {
 }
 
 func main() {
-	gatherEndpoints := flag.Bool("gather-endpoints", false,
-		"Generate a single object per service with all endpoints.")
+	// gatherEndpoints := flag.Bool("gather-endpoints", false,
+	// 	"Generate a single object per service with all endpoints.")
 
 	zapOpts := zap.Options{
 		Development:     true,
@@ -59,10 +62,20 @@ func main() {
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
 
-	specFile := SDWANOperatorSpec
-	if *gatherEndpoints {
-		specFile = SDWANOperatorGatherSpec
+	// Read vManage config
+	vManageConf, err := sdwan.ReadConfig(SDWANConfigFile)
+	if err != nil {
+		log.Error(err, "unable to read vManage config")
+		os.Exit(1)
 	}
+
+	// specFile := SDWANOperatorSpec
+	// if *gatherEndpoints {
+	// 	specFile = SDWANOperatorGatherSpec
+	// }
+
+	// SD-WAN managers requires the "gather endpoints" spec
+	specFile := SDWANOperatorGatherSpec
 
 	// Create a dmanager
 	mgr, err := dmanager.New(ctrl.GetConfigOrDie(), dmanager.Options{
@@ -81,12 +94,12 @@ func main() {
 	}
 
 	if _, err := doperator.NewFromFile("sdwan-operator", mgr, specFile, opts); err != nil {
-		log.Error(err, "unable to create pod autoscaler operator")
+		log.Error(err, "unable to create SDWAN operator")
 		os.Exit(1)
 	}
 
 	// Create the SD-WAN policy controller
-	if _, err := NewPolicyController(mgr, logger); err != nil {
+	if _, err := NewPolicyController(mgr, logger, *vManageConf); err != nil {
 		log.Error(err, "failed to create policy controller")
 		os.Exit(1)
 	}
@@ -112,16 +125,23 @@ func main() {
 	}
 }
 
-// implement the policy controller
+// policyController implements the policy controller
 type policyController struct {
 	client.Client
-	log logr.Logger
+	log          logr.Logger
+	sdwanManager sdwan.Manager
 }
 
-func NewPolicyController(mgr manager.Manager, log logr.Logger) (*policyController, error) {
+func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.Config) (*policyController, error) {
+	m, err := sdwan.NewManager(sdwanConf, log.WithName("sdwan-mngr"))
+	if err != nil {
+		return nil, err
+	}
+
 	r := &policyController{
-		Client: mgr.GetClient(),
-		log:    log.WithName("policy-ctrl"),
+		Client:       mgr.GetClient(),
+		log:          log.WithName("policy-ctrl"),
+		sdwanManager: *m,
 	}
 
 	on := true
@@ -168,15 +188,39 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 				fmt.Errorf("failed to look up added/updated object spec: %q", dobject.Dump(obj))
 		}
 
-		r.log.Info("Add/update SD-WAN tunnel policy", "name", obj.GetName(), "namespace", obj.GetNamespace(),
+		name := obj.GetName()
+		namespace := obj.GetNamespace()
+
+		r.log.Info("Add/update SD-WAN tunnel policy", "name", name, "namespace", namespace,
 			"spec", fmt.Sprintf("%#v", spec))
+
+		port := spec["targetPort"].(int64)
+		protocol := spec["protocol"].(string)
+		tunnel := spec["tunnel"].(string)
+		addresses, ok := spec["addresses"].([]interface{})
+		if !ok {
+			return reconcile.Result{}, errors.New("unable to parse endpoints from the spec")
+		}
+		var endpoints []string
+		for _, val := range addresses {
+			endpoints = append(endpoints, fmt.Sprintf("%v", val))
+		}
+
+		err = r.sdwanManager.HandleUpsertEvent(namespace, name, endpoints, port, protocol, tunnel)
+		if err != nil {
+			r.log.Error(err, "failed to upsert SD-WAN resources")
+		}
 
 	case cache.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
 
+		err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name)
+		if err != nil {
+			r.log.Error(err, "failed to delete SD-WAN resources")
+		}
+
 	default:
-		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace,
-			"type", req.EventType)
+		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace, "type", req.EventType)
 	}
 
 	return reconcile.Result{}, nil

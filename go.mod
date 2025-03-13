@@ -5,7 +5,11 @@ go 1.23.4
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/hsnlab/dcontroller v0.0.0-20250306202812-3481892a9f86
+	github.com/netascode/go-sdwan v0.1.6
+	github.com/tidwall/gjson v1.18.0
+	github.com/tidwall/sjson v1.2.5
 	go.uber.org/zap v1.26.0
+	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/apimachinery v0.32.2
 	k8s.io/client-go v0.32.2
 	sigs.k8s.io/controller-runtime v0.19.0
@@ -45,6 +49,8 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa // indirect
@@ -58,7 +64,6 @@ require (
 	google.golang.org/protobuf v1.36.5 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/api v0.32.2 // indirect
 	k8s.io/apiextensions-apiserver v0.31.0 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
@@ -70,3 +75,5 @@ require (
 )
 
 // replace github.com/hsnlab/dcontroller => /export/l7mp/dcontroller
+
+replace github.com/netascode/go-sdwan v0.1.6 => github.com/levaitamas/go-sdwan v0.0.0-20250127135848-71fa2d4ba9a2
