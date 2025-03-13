@@ -223,5 +223,7 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace, "type", req.EventType)
 	}
 
+	r.log.Info("Reconciliation done")
+
 	return reconcile.Result{}, nil
 }

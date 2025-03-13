@@ -103,7 +103,6 @@ func (m *Manager) HandleDeleteEvent(namespace, name string) error {
 
 	//nolint:errcheck
 	m.deactivateCentralPolicy()
-	m.waitTasksFinish()
 
 	// dataprefix
 	id, ok := m.objectCache["dataprefix"][objName]
@@ -139,7 +138,6 @@ func (m *Manager) HandleUpsertEvent(namespace, name string, endpoints []string, 
 
 	//nolint:errcheck
 	m.deactivateCentralPolicy()
-	m.waitTasksFinish()
 
 	// dataprefix
 	if err := m.upsertDataPrefixList(objName, endpoints); err != nil {
@@ -259,11 +257,15 @@ func (m *Manager) registerApproute(id string) error {
 }
 
 func (m *Manager) deactivateCentralPolicy() error {
-	return m.toggleCentralPolicy(false)
+	ret := m.toggleCentralPolicy(false)
+	m.waitTasksFinish()
+	return ret
 }
 
 func (m *Manager) activateCentralPolicy() error {
-	return m.toggleCentralPolicy(true)
+	ret := m.toggleCentralPolicy(true)
+	m.waitTasksFinish()
+	return ret
 }
 
 func (m *Manager) toggleCentralPolicy(activate bool) error {
@@ -298,6 +300,6 @@ func (m *Manager) waitTasksFinish() {
 		if ret.Get("runningTasks").String() == "[]" {
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
