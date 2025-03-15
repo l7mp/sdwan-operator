@@ -11,6 +11,7 @@ type Config struct {
 	Password string `yaml:"password"`
 	URL      string `yaml:"url"`
 	Insecure bool   `yaml:"insecure"`
+	DryRun   bool   `yaml:"dry-run,omitempty"`
 }
 
 // ReadConfig reads configuration from a yaml file
