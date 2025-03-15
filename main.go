@@ -39,15 +39,19 @@ const (
 	SDWANConfigFile                 = "vmanage-config.yaml"
 )
 
-var scheme = runtime.NewScheme()
+var (
+	scheme                         = runtime.NewScheme()
+	disableEndpointPooling, dryRun *bool
+)
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
 func main() {
-	// gatherEndpoints := flag.Bool("gather-endpoints", false,
-	// 	"Generate a single object per service with all endpoints.")
+	disableEndpointPooling = flag.Bool("disable-endpoint-pooling", false,
+		"Generate per-endpoint objects instead of a single object listing all service endpoints.")
+	dryRun = flag.Bool("dry-run", false, "Supporess SD-WAN policy updates.")
 
 	zapOpts := zap.Options{
 		Development:     true,
@@ -62,20 +66,15 @@ func main() {
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
 
-	// Read vManage config
-	vManageConf, err := sdwan.ReadConfig(SDWANConfigFile)
-	if err != nil {
-		log.Error(err, "unable to read vManage config")
-		os.Exit(1)
+	if *dryRun {
+		log.Info("dry-run mode enabled")
 	}
 
-	// specFile := SDWANOperatorSpec
-	// if *gatherEndpoints {
-	// 	specFile = SDWANOperatorGatherSpec
-	// }
-
-	// SD-WAN managers requires the "gather endpoints" spec
+	// Define the controller pipeline
 	specFile := SDWANOperatorGatherSpec
+	if *disableEndpointPooling {
+		specFile = SDWANOperatorSpec
+	}
 
 	// Create a dmanager
 	mgr, err := dmanager.New(ctrl.GetConfigOrDie(), dmanager.Options{
@@ -96,6 +95,17 @@ func main() {
 	if _, err := doperator.NewFromFile("sdwan-operator", mgr, specFile, opts); err != nil {
 		log.Error(err, "unable to create SDWAN operator")
 		os.Exit(1)
+	}
+
+	// Read vManage config
+	vManageConf := &sdwan.Config{DryRun: *dryRun}
+	if !*dryRun {
+		c, err := sdwan.ReadConfig(SDWANConfigFile)
+		if err != nil {
+			log.Error(err, "unable to read vManage config")
+			os.Exit(1)
+		}
+		vManageConf = c
 	}
 
 	// Create the SD-WAN policy controller
@@ -141,7 +151,7 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 	r := &policyController{
 		Client:       mgr.GetClient(),
 		log:          log.WithName("policy-ctrl"),
-		sdwanManager: *m,
+		sdwanManager: m,
 	}
 
 	on := true
@@ -194,6 +204,11 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 		r.log.Info("Add/update SD-WAN tunnel policy", "name", name, "namespace", namespace,
 			"spec", fmt.Sprintf("%#v", spec))
 
+		// Must use endoint-pooling when using a real manager
+		if *dryRun || *disableEndpointPooling {
+			return reconcile.Result{}, nil
+		}
+
 		port := spec["targetPort"].(int64)
 		protocol := spec["protocol"].(string)
 		tunnel := spec["tunnel"].(string)
@@ -213,6 +228,11 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 	case cache.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
+
+		// Must use endoint-pooling when using a real manager
+		if *dryRun || *disableEndpointPooling {
+			return reconcile.Result{}, nil
+		}
 
 		err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name)
 		if err != nil {

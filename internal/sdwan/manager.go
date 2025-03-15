@@ -23,13 +23,15 @@ var protocolNumbers = map[string]int32{
 	"UDP": 17,
 }
 
-type Manager struct {
-	client      sdwan.Client
-	objectCache map[string]map[string]string
-	log         logr.Logger
+type Manager interface {
+	HandleDeleteEvent(namespace, name string) error
+	HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error
 }
 
-func NewManager(c Config, log logr.Logger) (*Manager, error) {
+func NewManager(c Config, log logr.Logger) (Manager, error) {
+	if c.DryRun {
+		return &nullManager{}, nil
+	}
 
 	// connect to vManage
 	sc, err := sdwan.NewClient(c.URL, c.User, c.Password, c.Insecure)
@@ -37,7 +39,7 @@ func NewManager(c Config, log logr.Logger) (*Manager, error) {
 		return nil, err
 	}
 
-	m := &Manager{
+	m := &sdwanManager{
 		client:      sc,
 		objectCache: make(map[string]map[string]string),
 		log:         log,
@@ -52,7 +54,20 @@ func NewManager(c Config, log logr.Logger) (*Manager, error) {
 	return m, nil
 }
 
-func (m *Manager) initCache() error {
+type nullManager struct{}
+
+func (m *nullManager) HandleDeleteEvent(_, _ string) error { return nil }
+func (m *nullManager) HandleUpsertEvent(_, _ string, _ []string, _ int64, _, _ string) error {
+	return nil
+}
+
+type sdwanManager struct {
+	client      sdwan.Client
+	objectCache map[string]map[string]string
+	log         logr.Logger
+}
+
+func (m *sdwanManager) initCache() error {
 	// central policy
 	p, err := m.client.Get("/template/policy/vsmart")
 	if err != nil {
@@ -98,7 +113,7 @@ func (m *Manager) initCache() error {
 	return nil
 }
 
-func (m *Manager) HandleDeleteEvent(namespace, name string) error {
+func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
 	//nolint:errcheck
@@ -133,7 +148,7 @@ func (m *Manager) HandleDeleteEvent(namespace, name string) error {
 	return nil
 }
 
-func (m *Manager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
+func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
 	//nolint:errcheck
@@ -159,7 +174,7 @@ func (m *Manager) HandleUpsertEvent(namespace, name string, endpoints []string, 
 	return nil
 }
 
-func (m *Manager) upsertDataPrefixList(objName string, endpoints []string) error {
+func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) error {
 	prefixes := []string{}
 	for _, val := range endpoints {
 		prefixes = append(prefixes, "{ \"ipPrefix\": \""+val+"/32\"}")
@@ -190,7 +205,7 @@ func (m *Manager) upsertDataPrefixList(objName string, endpoints []string) error
 	return nil
 }
 
-func (m *Manager) upsertApproute(objName, port, proto, tunnel string) error {
+func (m *sdwanManager) upsertApproute(objName, port, proto, tunnel string) error {
 	dataPrefixList, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
 		return errors.New("fail to get dataprefix for new approute")
@@ -226,7 +241,7 @@ func (m *Manager) upsertApproute(objName, port, proto, tunnel string) error {
 	return nil
 }
 
-func (m *Manager) registerApproute(id string) error {
+func (m *sdwanManager) registerApproute(id string) error {
 	cpid, ok := m.objectCache["central"][CentralizedPolicyName]
 	if !ok {
 		return errors.New("failed to get centralized policy name")
@@ -256,19 +271,19 @@ func (m *Manager) registerApproute(id string) error {
 	return nil
 }
 
-func (m *Manager) deactivateCentralPolicy() error {
+func (m *sdwanManager) deactivateCentralPolicy() error {
 	ret := m.toggleCentralPolicy(false)
 	m.waitTasksFinish()
 	return ret
 }
 
-func (m *Manager) activateCentralPolicy() error {
+func (m *sdwanManager) activateCentralPolicy() error {
 	ret := m.toggleCentralPolicy(true)
 	m.waitTasksFinish()
 	return ret
 }
 
-func (m *Manager) toggleCentralPolicy(activate bool) error {
+func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
 	id, ok := m.objectCache["central"][CentralizedPolicyName]
 	if !ok {
 		return errors.New("fail to get centralized policy name")
@@ -290,7 +305,7 @@ func (m *Manager) toggleCentralPolicy(activate bool) error {
 	return nil
 }
 
-func (m *Manager) waitTasksFinish() {
+func (m *sdwanManager) waitTasksFinish() {
 	endpoint := "/device/action/status/tasks"
 	for {
 		ret, err := m.client.Get(endpoint)
