@@ -265,9 +265,10 @@ func (m *sdwanManager) registerApproute(id string) error {
 		return err
 	}
 
+	endpoint = "/template/policy/vsmart/" + cpid
 	res, err := m.client.Put(endpoint, data)
 	if err != nil {
-		m.log.Error(err, fmt.Sprintf(">>> PUT %s: %s, result: %s", endpoint, data, res))
+		m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
 		return err
 	}
 	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
