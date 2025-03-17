@@ -253,18 +253,19 @@ func (m *sdwanManager) registerApproute(id string) error {
 		return err
 	}
 
-	template := desc.Get("policyDefinition.assembly.1")
+	template := desc.Get("policyDefinition.assembly.0")
 	newVal, err := sjson.Set(template.String(), "definitionId", id)
 	if err != nil {
 		return err
 	}
-	data, err := sjson.Set(desc.String(), "policyDefinition.assembly.-1", newVal)
+	data, err := sjson.SetRaw(desc.String(), "policyDefinition.assembly.-1", newVal)
 	if err != nil {
 		return err
 	}
 
 	res, err := m.client.Put(endpoint, data)
 	if err != nil {
+		m.log.Error(err, fmt.Sprintf(">>> PUT %s: %s, result: %s", endpoint, data, res))
 		return err
 	}
 	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
