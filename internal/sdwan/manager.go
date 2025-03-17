@@ -122,6 +122,7 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	// approute
 	id, ok := m.objectCache["approute"][objName]
 	if ok {
+		delete(m.objectCache["approute"], objName)
 		endpoint := "/template/policy/definition/approute/" + id
 		res, err := m.client.Delete(endpoint)
 		if err != nil {
@@ -133,6 +134,7 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	// dataprefix
 	id, ok = m.objectCache["dataprefix"][objName]
 	if ok {
+		delete(m.objectCache["dataprefix"], objName)
 		endpoint := "/template/policy/list/dataprefix/" + id
 		res, err := m.client.Delete(endpoint)
 		if err != nil {
