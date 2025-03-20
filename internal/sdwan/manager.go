@@ -3,6 +3,7 @@ package sdwan
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 const (
 	CentralizedPolicyName = "SDWANOperatorCentralizedPolicy"
+	ApproutePolicyName    = "SDWANOperatorApproutePolicy"
 	defaultDescription    = "managed by SD-WAN operator"
 )
 
@@ -119,29 +121,38 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	//nolint:errcheck
 	m.deactivateCentralPolicy()
 
-	// approute
-	id, ok := m.objectCache["approute"][objName]
-	if ok {
-		delete(m.objectCache["approute"], objName)
-		endpoint := "/template/policy/definition/approute/" + id
-		res, err := m.client.Delete(endpoint)
-		if err != nil {
-			return err
-		}
-		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
+	// det dataprefixlist id
+	dpid, ok := m.objectCache["dataprefix"][objName]
+	if !ok {
+		return errors.New("fail to get dataprefix id")
 	}
 
-	// dataprefix
-	id, ok = m.objectCache["dataprefix"][objName]
-	if ok {
-		delete(m.objectCache["dataprefix"], objName)
-		endpoint := "/template/policy/list/dataprefix/" + id
-		res, err := m.client.Delete(endpoint)
-		if err != nil {
-			return err
-		}
-		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
+	// update approte seq rules
+	id, ok := m.objectCache["approute"][ApproutePolicyName]
+	if !ok {
+		return errors.New("fail to get approute id")
 	}
+
+	endpoint := "/template/policy/definition/approute/" + id
+	data, err := m.filterSequenceRules(dpid, endpoint)
+	if err != nil {
+		return err
+	}
+
+	res, err := m.client.Put(endpoint, data)
+	if err != nil {
+		return err
+	}
+	m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
+
+	// delete dataprefix
+	delete(m.objectCache["dataprefix"], objName)
+	endpoint = "/template/policy/list/dataprefix/" + dpid
+	res, err = m.client.Delete(endpoint)
+	if err != nil {
+		return err
+	}
+	m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
 
 	if err := m.activateCentralPolicy(); err != nil {
 		return err
@@ -165,7 +176,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 	port := strconv.Itoa(int(targetPort))
 	proto := strconv.Itoa(int(protocolNumbers[protocol]))
 
-	if err := m.upsertApproute(objName, port, proto, tunnel); err != nil {
+	if err := m.updateApproute(objName, port, proto, tunnel); err != nil {
 		return err
 	}
 
@@ -177,14 +188,8 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 }
 
 func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) error {
-	prefixes := []string{}
-	for _, val := range endpoints {
-		prefixes = append(prefixes, "{ \"ipPrefix\": \""+val+"/32\"}")
-	}
-
+	data := m.generateDataPrefixList(objName, endpoints)
 	endpoint := "/template/policy/list/dataprefix/"
-	data := "{\"name\": \"" + objName + "\", \"description\": \"" + defaultDescription + "\", \"type\": \"dataPrefix\", \"entries\": [" + strings.Join(prefixes, ",") + "]}"
-
 	id, ok := m.objectCache["dataprefix"][objName]
 	if ok {
 		putEndpoint := endpoint + id
@@ -207,72 +212,83 @@ func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) 
 	return nil
 }
 
-func (m *sdwanManager) upsertApproute(objName, port, proto, tunnel string) error {
+func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error {
 	dataPrefixList, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
-		return errors.New("fail to get dataprefix for new approute")
+		return errors.New("fail to get dataprefix")
 	}
 
-	endpoint := "/template/policy/definition/approute/"
-	data := "{\"name\": \"" + objName + "\", \"description\": \"" + defaultDescription + "\", \"type\": \"appRoute\", \"sequences\": [{\"sequenceId\": 1, \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"sourceDataPrefixList\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"sourcePort\", \"value\": \"" + port + "\"},{\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}, {\"sequenceId\": 11, \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"destinationDataPrefixList\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"destinationPort\", \"value\": \"" + port + "\"}, {\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}]}"
-
-	id, ok := m.objectCache["approute"][objName]
-	if ok {
-		putEndpoint := endpoint + id
-		res, err := m.client.Put(putEndpoint, data)
-		if err != nil {
-			m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", putEndpoint, data, res))
-			return err
-		}
-		m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", putEndpoint, data, res))
-	} else {
-		res, err := m.client.Post(endpoint, data)
-		if err != nil {
-			m.log.Error(err, fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
-			return err
-		}
-		id := res.Get("definitionId").String()
-		m.objectCache["approute"][objName] = id
-		m.log.Info(fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
-
-		if err := m.registerApproute(id); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (m *sdwanManager) registerApproute(id string) error {
-	cpid, ok := m.objectCache["central"][CentralizedPolicyName]
+	id, ok := m.objectCache["approute"][ApproutePolicyName]
 	if !ok {
-		return errors.New("failed to get centralized policy name")
+		return errors.New("fail to get approute")
 	}
-	endpoint := "/template/policy/vsmart/definition/" + cpid
 
-	desc, err := m.client.Get(endpoint)
+	// get approute without existing seq rules matchin on the dataprefix
+	endpoint := "/template/policy/definition/approute/" + id
+	desc, err := m.filterSequenceRules(dataPrefixList, endpoint)
 	if err != nil {
 		return err
 	}
 
-	template := desc.Get("policyDefinition.assembly.0")
-	newVal, err := sjson.Set(template.String(), "definitionId", id)
+	// get sequence ID
+	s := gjson.Get(desc, "sequences.#.sequenceId")
+	sids := make([]int64, 0, len(s.Array()))
+	for _, v := range s.Array() {
+		sids = append(sids, v.Int())
+	}
+	sid := 1
+	if len(sids) > 0 {
+		sid = int(slices.Max(sids) + 1)
+	}
+
+	// install new seqrules
+	dataSrc := m.generateSeqRule(strconv.Itoa(sid), "sourceDataPrefixList", dataPrefixList, port, proto, tunnel)
+	dataDst := m.generateSeqRule(strconv.Itoa(sid+1), "destinationDataPrefixList", dataPrefixList, port, proto, tunnel)
+
+	data, err := sjson.SetRaw(desc, "sequences.-1", dataSrc)
 	if err != nil {
 		return err
 	}
-	data, err := sjson.SetRaw(desc.String(), "policyDefinition.assembly.-1", newVal)
+	data, err = sjson.SetRaw(data, "sequences.-1", dataDst)
 	if err != nil {
 		return err
 	}
 
-	endpoint = "/template/policy/vsmart/" + cpid
 	res, err := m.client.Put(endpoint, data)
 	if err != nil {
 		m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
 		return err
 	}
 	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
+
 	return nil
+}
+
+func (m *sdwanManager) filterSequenceRules(dataprefixId, endpoint string) (string, error) {
+	desc, err := m.client.Get(endpoint)
+	if err != nil {
+		return "", err
+	}
+	s := gjson.Get(desc.String(), "sequences.#(match.entries.0.ref!=\""+dataprefixId+"\")#")
+	data, err := sjson.SetRaw(desc.String(), "sequences", s.String())
+	if err != nil {
+		return "", err
+	}
+
+	return data, nil
+}
+
+func (m *sdwanManager) generateSeqRule(id, prefixListType, dataPrefixList, port, proto, tunnel string) string {
+	return "{\"sequenceId\": " + id + ", \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"" + prefixListType + "\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"destinationPort\", \"value\": \"" + port + "\"}, {\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}]}"
+}
+
+func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) string {
+	prefixes := make([]string, len(endpoints)-1)
+	for _, val := range endpoints {
+		prefixes = append(prefixes, "{ \"ipPrefix\": \""+val+"/32\"}")
+	}
+
+	return "{\"name\": \"" + name + "\", \"description\": \"" + defaultDescription + "\", \"type\": \"dataPrefix\", \"entries\": [" + strings.Join(prefixes, ",") + "]}"
 }
 
 func (m *sdwanManager) deactivateCentralPolicy() error {
