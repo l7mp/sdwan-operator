@@ -4,7 +4,7 @@ go 1.23.4
 
 require (
 	github.com/go-logr/logr v1.4.2
-	github.com/hsnlab/dcontroller v0.0.0-20250317172030-2168f86f90b1
+	github.com/hsnlab/dcontroller v0.0.0-20250318114755-cf98fcf8815c
 	github.com/netascode/go-sdwan v0.1.6
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
