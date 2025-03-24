@@ -5,7 +5,7 @@ go 1.23.6
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/hsnlab/dcontroller v0.0.0-20250318114755-cf98fcf8815c
-	github.com/netascode/go-sdwan v0.1.7
+	github.com/netascode/go-sdwan v0.1.8
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	go.uber.org/zap v1.26.0

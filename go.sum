@@ -84,8 +84,8 @@ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9G
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
-github.com/netascode/go-sdwan v0.1.7 h1:WNg637UEqyVbahOtFEC9XmOsq74LcIryKorku7IwIFg=
-github.com/netascode/go-sdwan v0.1.7/go.mod h1:ihR5jCw0uyPhA+o9pr5RQJMPdJhUPusDyJ/uXFtWGqo=
+github.com/netascode/go-sdwan v0.1.8 h1:ZdYHCqcX42u7JqJOeucH3p5Us+ySD2Q+Auxh8qo3jZc=
+github.com/netascode/go-sdwan v0.1.8/go.mod h1:ihR5jCw0uyPhA+o9pr5RQJMPdJhUPusDyJ/uXFtWGqo=
 github.com/ohler55/ojg v1.23.0 h1:xjJasLaKf4dKkyJq0CNXQMRdL7F1172tms885aPKcS0=
 github.com/ohler55/ojg v1.23.0/go.mod h1:gQhDVpQLqrmnd2eqGAvJtn+NfKoYJbe/A4Sj3/Vro4o=
 github.com/onsi/ginkgo/v2 v2.21.0 h1:7rg/4f3rB88pb5obDgNZrNHrQ4e6WpjonchcpuBRnZM=
