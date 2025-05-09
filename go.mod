@@ -4,7 +4,7 @@ go 1.23.6
 
 require (
 	github.com/go-logr/logr v1.4.2
-	github.com/hsnlab/dcontroller v0.0.0-20250318114755-cf98fcf8815c
+	github.com/l7mp/dcontroller v0.0.0-20250509092700-f21090d2d013
 	github.com/netascode/go-sdwan v0.1.8
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
@@ -74,4 +74,4 @@ require (
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
-// replace github.com/hsnlab/dcontroller => /export/l7mp/dcontroller
+// replace github.com/l7mp/dcontroller => /export/l7mp/dcontroller
