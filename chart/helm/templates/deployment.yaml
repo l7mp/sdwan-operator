@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    control-plane: sdwan-operator
+  name: sdwan-operator
+  namespace: {{ $.Values.namespace | default $.Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: sdwan-operator
+  template:
+    metadata:
+      labels:
+        control-plane: sdwan-operator
+    spec:
+      containers:
+      - name: sdwan-operator
+        image: '{{ .Values.image.name }}:{{ .Values.image.tag }}'
+        imagePullPolicy: '{{ .Values.image.pullPolicy }}'
+        {{- with .Values.imagePullSecrets }}
+        imagePullSecrets:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        args:
+          - "-config-file"
+          - "/config/vmanage-config.yaml"
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+        volumeMounts:
+          - mountPath: "/config"
+            name: vmanage-config
+            readOnly: true
+      volumes:
+        - name: vmanage-config
+          secret:
+            secretName: vmanage-config
+      securityContext:
+        runAsNonRoot: true
+      serviceAccountName: sdwan-operator
+      terminationGracePeriodSeconds: 60
