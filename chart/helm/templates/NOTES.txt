@@ -1,0 +1,6 @@
+SD-WAN operator installed.
+
+Documentation: https://github.com/l7mp/sdwan-operator
+
+To cleanup:
+helm uninstall {{ .Release.Name }}

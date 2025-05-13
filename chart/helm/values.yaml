@@ -1,0 +1,21 @@
+# Default values for sdwan-operator.
+
+# To set the namespace for the deployment use the --namespace=<your-namespace> --create-namespace
+# additional commands when installing your release
+# It will create the desired namespace if not present
+
+imagePullSecrets:
+# - name: docker-registry-secret
+
+
+image:
+  name: docker.io/l7mp/sdwan-operator
+  tag: latest
+  pullPolicy: Always
+
+
+vmanageConfig:
+  url: REPLACE_WITH_YOUR_URL
+  username: REPLACE_WITH_YOUR_USERNAME
+  password: REPLACE_WITH_YOUR_PASSWORD
+  insecure: true
