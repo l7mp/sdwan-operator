@@ -42,6 +42,7 @@ const (
 var (
 	scheme                         = runtime.NewScheme()
 	disableEndpointPooling, dryRun *bool
+	configFile                     *string
 )
 
 func init() {
@@ -51,7 +52,9 @@ func init() {
 func main() {
 	disableEndpointPooling = flag.Bool("disable-endpoint-pooling", false,
 		"Generate per-endpoint objects instead of a single object listing all service endpoints.")
-	dryRun = flag.Bool("dry-run", false, "Supporess SD-WAN policy updates.")
+	dryRun = flag.Bool("dry-run", false, "Suppress SD-WAN policy updates.")
+
+	configFile = flag.String("config-file", SDWANConfigFile, "Config file path")
 
 	zapOpts := zap.Options{
 		Development:     true,
@@ -100,7 +103,7 @@ func main() {
 	// Read vManage config
 	vManageConf := &sdwan.Config{DryRun: *dryRun}
 	if !*dryRun {
-		c, err := sdwan.ReadConfig(SDWANConfigFile)
+		c, err := sdwan.ReadConfig(*configFile)
 		if err != nil {
 			log.Error(err, "unable to read vManage config")
 			os.Exit(1)
