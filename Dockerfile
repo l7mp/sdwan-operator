@@ -9,7 +9,7 @@ RUN go mod download
 
 COPY main.go main.go
 COPY internal/ internal/
-COPY artifacts/ artifacts/
+#COPY artifacts/ artifacts/
 
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o sdwan-operator .
 
@@ -21,6 +21,8 @@ FROM gcr.io/distroless/static:nonroot
 
 WORKDIR /
 COPY --from=builder /build/sdwan-operator .
+COPY artifacts/ artifacts/
+
 USER 65532:65532
 
 ENTRYPOINT ["/sdwan-operator"]
