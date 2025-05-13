@@ -1,0 +1,14 @@
+apiVersion: v1
+entries:
+  sdwan-operator:
+  - apiVersion: v2
+    appVersion: 1.0.0
+    created: "2025-05-13T21:15:48.368681336Z"
+    description: A Helm chart for the SD-WAN operator
+    digest: d95b8898d8533c6bc2b9c5f3a982c3fc90c079e6e35d731ab8ab6180b9f8bd56
+    name: sdwan-operator
+    type: application
+    urls:
+    - https://l7mp.github.io/sdwan-operator/sdwan-operator-0.1.0.tgz
+    version: 0.1.0
+generated: "2025-05-13T21:15:48.368372317Z"
