@@ -14,7 +14,7 @@ image:
   pullPolicy: Always
 
 
-vmanageConfig:
+vmanage:
   url: "https://sdwan-vmanage-00.bme.cn-automation.net:8443"
   username: "admin"
   password: "Pqq8F9VrKx6ntsIY"
