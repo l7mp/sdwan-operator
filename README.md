@@ -5,7 +5,7 @@
 Register the repository with Helm.
 
 ``` console
-helm repo add dcontroller https://l7mp.github.io/sdwan-operator/
+helm repo add sdwan-operator https://l7mp.github.io/sdwan-operator/
 helm repo update
 ```
 
@@ -19,6 +19,6 @@ helm install sdwan-operator sdwan-operator/sdwan-operator
 
 ## License
 
-Copyright 2025 by its authors. Some rights reserved. See [AUTHORS](AUTHORS).
+Copyright 2025 by its authors. Some rights reserved. See [AUTHORS](https://github.com/l7mp/sdwan-operator/blob/main/AUTHORS).
 
-Apache License - see [LICENSE](LICENSE) for full text.
+Apache License - see [LICENSE](https://github.com/l7mp/sdwan-operator/blob/main/LICENSE) for full text.
