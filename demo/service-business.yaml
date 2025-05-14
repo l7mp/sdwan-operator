@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: business
+  name: business-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: business
+  template:
+    metadata:
+      labels:
+        app: business
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: cluster2
+      containers:
+      - name: business-app
+        image: docker.io/levaitamas/hello-node:extra
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: business
+  annotations:
+    # service.cilium.io/global: "true"
+    # service.cilium.io/global-sync-endpoint-slices: "true"
+    policy.sdwan.cisco.com/tunnel: biz-internet
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8081
+    targetPort: 8080
+  selector:
+    app: business

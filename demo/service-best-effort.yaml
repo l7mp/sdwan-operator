@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: best-effort
+  name: best-effort-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: best-effort
+  template:
+    metadata:
+      labels:
+        app: best-effort
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: cluster2
+      containers:
+      - name: best-effort-app
+        image: docker.io/levaitamas/hello-node:extra
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: best-effort
+  annotations:
+    # service.cilium.io/global: "true"
+    # service.cilium.io/global-sync-endpoint-slices: "true"
+    # policy.sdwan.cisco.com/tunnel: default
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8082
+    targetPort: 8080
+  selector:
+    app: best-effort
