@@ -14,7 +14,7 @@ image:
   pullPolicy: Always
 
 
-vmanageConfig:
+vmanage:
   url: REPLACE_WITH_YOUR_URL
   username: REPLACE_WITH_YOUR_USERNAME
   password: REPLACE_WITH_YOUR_PASSWORD
