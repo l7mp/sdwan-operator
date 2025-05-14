@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: business
+  name: business-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: business
+  template:
+    metadata:
+      labels:
+        app: business
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: cluster1
+      containers:
+      - name: client
+        image: docker.io/l7mp/net-debug:extra
