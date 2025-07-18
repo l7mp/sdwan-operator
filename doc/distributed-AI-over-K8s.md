@@ -42,7 +42,6 @@ This table outlines the common frameworks and Kubernetes-native abstractions use
 | **MPI-based Workloads** | Direct Pod-to-Pod (via MPI) | **Headless Service** | `MPIJob` (via `mpi-operator`) | The `mpi-operator` standardizes MPI job launches. It creates a Headless Service to provide stable hostnames for the `mpirun` command's host file. |
 | **Ray** | Direct Pod-to-Pod (via gRPC) | **Headless Service** for Ray workers, `ClusterIP` for the head. | `RayCluster` (via `KubeRay operator`) | The KubeRay operator creates a Headless Service for workers to join the cluster managed by the head node. All task-related communication is direct pod-to-pod. |
 | **Kubeflow Training Operator** | Direct Pod-to-Pod | **Headless Service** / Environment Variables | `PyTorchJob`, `TFJob`, etc. | The operator automatically creates a Headless Service and injects environment variables (like `MASTER_ADDR`, `WORLD_SIZE`) into each pod for discovery. |
-| **Indexed Jobs** | Direct Pod-to-Pod | Predictable DNS Hostnames | `Job` (with `completionMode: Indexed`) | Kubernetes natively provides stable hostnames (e.g., `job-name-i.subdomain`) for each pod, which can be used for discovery without a Headless Service. |
 | **JobSet API** | Direct Pod-to-Pod | **Automatically Created Headless Service** | `JobSet` | A higher-level API that automates the creation of a Headless Service for the managed jobs, simplifying worker discovery for the entire group. |
 
 ## Distributed AI Inferencing on Kubernetes
