@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	opv1a1 "github.com/l7mp/dcontroller/pkg/api/operator/v1alpha1"
-	"github.com/l7mp/dcontroller/pkg/cache"
+	"github.com/l7mp/dcontroller/pkg/object"
 	dmanager "github.com/l7mp/dcontroller/pkg/manager"
 	dobject "github.com/l7mp/dcontroller/pkg/object"
 	doperator "github.com/l7mp/dcontroller/pkg/operator"
@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// Create a dmanager
-	mgr, err := dmanager.New(ctrl.GetConfigOrDie(), dmanager.Options{
+	mgr, err := dmanager.New(ctrl.GetConfigOrDie(), "sdwan-operator", dmanager.Options{
 		Options: ctrl.Options{Scheme: scheme},
 	})
 	if err != nil {
@@ -166,7 +166,7 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 		return nil, err
 	}
 
-	src, err := dreconciler.NewSource(mgr, opv1a1.Source{
+	src, err := dreconciler.NewSource(mgr, "sdwan-operator", opv1a1.Source{
 		Resource: opv1a1.Resource{
 			Kind: "TunnelPolicyView",
 		},
@@ -188,8 +188,8 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 	// vManage update
 	switch req.EventType {
-	case cache.Added, cache.Updated, cache.Upserted:
-		obj := dobject.NewViewObject(req.GVK.Kind)
+	case object.Added, object.Updated, object.Upserted:
+		obj := dobject.NewViewObject("sdwan-operator", req.GVK.Kind)
 		if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj); err != nil {
 			r.log.Error(err, "failed to get added/updated object", "delta-type", req.EventType)
 			return reconcile.Result{}, err
@@ -229,7 +229,7 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 			r.log.Error(err, "failed to upsert SD-WAN resources")
 		}
 
-	case cache.Deleted:
+	case object.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
 
 		// Must use endoint-pooling when using a real manager

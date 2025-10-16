@@ -64,15 +64,13 @@ controllers:
             "@eq": ["$.endpoints.conditions.ready", true]
         - "@unwind": $.endpoints.addresses
         - "@project":
-            # use @merge so that expressions are applied in order
-            "@merge":
-              - {metadata: $.metadata}
-              - {spec: $.spec}
-              - {"$.spec.address": "$.endpoints.addresses"}
-              - "$.metadata.name":
-                  "@concat":
-                    - $.spec.serviceName
-                    - "-"
-                    - { "@hash": $.spec }
+            - {metadata: $.metadata}
+            - {spec: $.spec}
+            - {"$.spec.address": "$.endpoints.addresses"}
+            - "$.metadata.name":
+                "@concat":
+                  - $.spec.serviceName
+                  - "-"
+                  - { "@hash": $.spec }
     target:
       kind: TunnelPolicyView
