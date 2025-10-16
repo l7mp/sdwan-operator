@@ -75,17 +75,15 @@ controllers:
             - $.id
             - $.endpoints.addresses
         - "@project":
-            # use @merge so that expressions are applied in order
-            "@merge":
-              - {metadata: $.metadata}
-              - {spec: $.spec}
-              - {"$.spec.addresses": $.endpoints.addresses}
-              - "$.metadata.name":
-                  "@concat":
-                    - $.spec.serviceName
-                    - "-"
-                    - $.spec.protocol
-                    - "-"
-                    - $.spec.port
+            - {metadata: $.metadata}
+            - {spec: $.spec}
+            - {"$.spec.addresses": $.endpoints.addresses}
+            - "$.metadata.name":
+                "@concat":
+                  - $.spec.serviceName
+                  - "-"
+                  - $.spec.protocol
+                  - "-"
+                  - $.spec.port
     target:
       kind: TunnelPolicyView
