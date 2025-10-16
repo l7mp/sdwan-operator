@@ -23,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	opv1a1 "github.com/l7mp/dcontroller/pkg/api/operator/v1alpha1"
-	"github.com/l7mp/dcontroller/pkg/object"
 	dmanager "github.com/l7mp/dcontroller/pkg/manager"
 	dobject "github.com/l7mp/dcontroller/pkg/object"
 	doperator "github.com/l7mp/dcontroller/pkg/operator"
@@ -188,7 +187,7 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 	// vManage update
 	switch req.EventType {
-	case object.Added, object.Updated, object.Upserted:
+	case dobject.Added, dobject.Updated, dobject.Upserted:
 		obj := dobject.NewViewObject("sdwan-operator", req.GVK.Kind)
 		if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj); err != nil {
 			r.log.Error(err, "failed to get added/updated object", "delta-type", req.EventType)
@@ -229,7 +228,7 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 			r.log.Error(err, "failed to upsert SD-WAN resources")
 		}
 
-	case object.Deleted:
+	case dobject.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
 
 		// Must use endoint-pooling when using a real manager
