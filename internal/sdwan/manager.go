@@ -283,7 +283,7 @@ func (m *sdwanManager) generateSeqRule(id, prefixListType, dataPrefixList, port,
 }
 
 func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) string {
-	prefixes := make([]string, len(endpoints)-1)
+	prefixes := make([]string, 0, len(endpoints)-1)
 	for _, val := range endpoints {
 		prefixes = append(prefixes, "{ \"ipPrefix\": \""+val+"/32\"}")
 	}
