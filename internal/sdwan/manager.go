@@ -118,8 +118,9 @@ func (m *sdwanManager) initCache() error {
 func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
-	//nolint:errcheck
-	m.deactivateCentralPolicy()
+	if err := m.deactivateCentralPolicy(); err != nil {
+		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue delete. err: %s", err))
+	}
 
 	// det dataprefixlist id
 	dpid, ok := m.objectCache["dataprefix"][objName]
@@ -164,8 +165,9 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
-	//nolint:errcheck
-	m.deactivateCentralPolicy()
+	if err := m.deactivateCentralPolicy(); err != nil {
+		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue upsert. err: %s", err))
+	}
 
 	// dataprefix
 	if err := m.upsertDataPrefixList(objName, endpoints); err != nil {
