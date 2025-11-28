@@ -244,8 +244,8 @@ func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error
 	}
 
 	// install new seqrules
-	dataSrc := m.generateSeqRule(strconv.Itoa(sid), "sourceDataPrefixList", dataPrefixList, port, proto, tunnel)
-	dataDst := m.generateSeqRule(strconv.Itoa(sid+1), "destinationDataPrefixList", dataPrefixList, port, proto, tunnel)
+	dataSrc := m.generateSeqRule(strconv.Itoa(sid), "sourceDataPrefixList", dataPrefixList, "source", port, proto, tunnel)
+	dataDst := m.generateSeqRule(strconv.Itoa(sid+1), "destinationDataPrefixList", dataPrefixList, "destination", port, proto, tunnel)
 
 	data, err := sjson.SetRaw(desc, "sequences.-1", dataSrc)
 	if err != nil {
@@ -280,8 +280,8 @@ func (m *sdwanManager) filterSequenceRules(dataprefixId, endpoint string) (strin
 	return data, nil
 }
 
-func (m *sdwanManager) generateSeqRule(id, prefixListType, dataPrefixList, port, proto, tunnel string) string {
-	return "{\"sequenceId\": " + id + ", \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"" + prefixListType + "\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"destinationPort\", \"value\": \"" + port + "\"}, {\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}]}"
+func (m *sdwanManager) generateSeqRule(id, prefixListType, dataPrefixList, direction, port, proto, tunnel string) string {
+	return "{\"sequenceId\": " + id + ", \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"" + prefixListType + "\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"" + direction + "Port\", \"value\": \"" + port + "\"}, {\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}]}"
 }
 
 func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) string {
