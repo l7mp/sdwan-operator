@@ -317,7 +317,10 @@ func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
 	}
 
 	endpoint := baseUrl + id
-	data := "{}"
+	var data string
+	if activate {
+		data = "{}"
+	}
 	res, err := m.client.Post(endpoint, data)
 	if err != nil {
 		return err
