@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/go-logr/logr"
@@ -67,6 +68,9 @@ func main() {
 	logger := zap.New(zap.UseFlagOptions(&zapOpts))
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
+
+	slogHandler := logr.ToSlogHandler(log)
+	slog.SetDefault(slog.New(slogHandler))
 
 	if *dryRun {
 		log.Info("dry-run mode enabled")
