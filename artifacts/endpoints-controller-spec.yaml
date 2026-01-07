@@ -8,28 +8,27 @@ controllers:
       - apiGroup: ""
         kind: Service
     pipeline:
-      "@aggregate":
-        - "@select":
-            "@exists": '$["metadata"]["annotations"]["policy.sdwan.cisco.com/tunnel"]'
-        - "@project":
-            metadata:
-              name: $.metadata.name
-              namespace: $.metadata.namespace
-            spec:
-              serviceName: $.metadata.name
-              type: $.spec.type
-              tunnel: '$["metadata"]["annotations"]["policy.sdwan.cisco.com/tunnel"]'
-              ports: $.spec.ports
-        - "@unwind": $.spec.ports
-        - "@project":
-            metadata: $.metadata
-            spec:
-              type: $.spec.type
-              serviceName: $.spec.serviceName
-              tunnel: $.spec.tunnel
-              port: $.spec.ports.port
-              protocol: $.spec.ports.protocol
-              targetPort: $.spec.ports.targetPort
+      - "@select":
+          "@exists": '$["metadata"]["annotations"]["policy.sdwan.cisco.com/tunnel"]'
+      - "@project":
+          metadata:
+            name: $.metadata.name
+            namespace: $.metadata.namespace
+          spec:
+            serviceName: $.metadata.name
+            type: $.spec.type
+            tunnel: '$["metadata"]["annotations"]["policy.sdwan.cisco.com/tunnel"]'
+            ports: $.spec.ports
+      - "@unwind": $.spec.ports
+      - "@project":
+          metadata: $.metadata
+          spec:
+            type: $.spec.type
+            serviceName: $.spec.serviceName
+            tunnel: $.spec.tunnel
+            port: $.spec.ports.port
+            protocol: $.spec.ports.protocol
+            targetPort: $.spec.ports.targetPort
     target:
       kind: ServiceView
   # endpointslice controller:
@@ -44,35 +43,34 @@ controllers:
       - apiGroup: "discovery.k8s.io"
         kind: EndpointSlice
     pipeline:
-      "@join":
-        "@and":
-          - '@eq':
-              - $.ServiceView.spec.serviceName
-              - '$["EndpointSlice"]["metadata"]["labels"]["kubernetes.io/service-name"]'
-          - '@eq':
-              - $.ServiceView.metadata.namespace
-              - $.EndpointSlice.metadata.namespace
-      "@aggregate":
-        - "@project":
-            metadata:
-              name: $.EndpointSlice.metadata.name
-              namespace: $.EndpointSlice.metadata.namespace
-            spec: $.ServiceView.spec
-            endpoints: $.EndpointSlice.endpoints
-        - "@unwind": $.endpoints
-        - "@select":
-            "@eq": ["$.endpoints.conditions.ready", true]
-        - "@unwind": $.endpoints.addresses
-        - "@project":
-            # use @merge so that expressions are applied in order
-            "@merge":
-              - {metadata: $.metadata}
-              - {spec: $.spec}
-              - {"$.spec.address": "$.endpoints.addresses"}
-              - "$.metadata.name":
-                  "@concat":
-                    - $.spec.serviceName
-                    - "-"
-                    - { "@hash": $.spec }
+      - "@join":
+          "@and":
+            - '@eq':
+                - $.ServiceView.spec.serviceName
+                - '$["EndpointSlice"]["metadata"]["labels"]["kubernetes.io/service-name"]'
+            - '@eq':
+                - $.ServiceView.metadata.namespace
+                - $.EndpointSlice.metadata.namespace
+      - "@project":
+          metadata:
+            name: $.EndpointSlice.metadata.name
+            namespace: $.EndpointSlice.metadata.namespace
+          spec: $.ServiceView.spec
+          endpoints: $.EndpointSlice.endpoints
+      - "@unwind": $.endpoints
+      - "@select":
+          "@eq": ["$.endpoints.conditions.ready", true]
+      - "@unwind": $.endpoints.addresses
+      - "@project":
+          # use @merge so that expressions are applied in order
+          "@merge":
+            - {metadata: $.metadata}
+            - {spec: $.spec}
+            - {"$.spec.address": "$.endpoints.addresses"}
+            - "$.metadata.name":
+                "@concat":
+                  - $.spec.serviceName
+                  - "-"
+                  - { "@hash": $.spec }
     target:
       kind: TunnelPolicyView
