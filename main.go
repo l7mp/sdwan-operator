@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/go-logr/logr"
@@ -23,7 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	opv1a1 "github.com/l7mp/dcontroller/pkg/api/operator/v1alpha1"
-	dmanager "github.com/l7mp/dcontroller/pkg/manager"
+	"github.com/l7mp/dcontroller/pkg/apiserver"
+	"github.com/l7mp/dcontroller/pkg/cache"
 	"github.com/l7mp/dcontroller/pkg/object"
 	doperator "github.com/l7mp/dcontroller/pkg/operator"
 	dreconciler "github.com/l7mp/dcontroller/pkg/reconciler"
@@ -36,37 +38,53 @@ const (
 	SDWANOperatorGatherSpec         = "artifacts/endpoints-controller-gather-spec.yaml"
 	SDWANPolicyTunnelAnnotationName = "policy.sdwan.cisco.com/tunnel"
 	SDWANConfigFile                 = "vmanage-config.yaml"
+	apiServerPort                   = 8443
 )
 
 var (
 	scheme                         = runtime.NewScheme()
 	disableEndpointPooling, dryRun *bool
 	configFile                     *string
+	server                         *apiserver.APIServer
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
-func NewManager(ctx context.Context, specFile string, logger logr.Logger) (dmanager.Manager, error) {
+func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, error) {
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
 
 	// Create a dmanager
 	config := ctrl.GetConfigOrDie()
-	mgr, err := dmanager.New(config, dmanager.Options{Scheme: scheme})
+	api, err := cache.NewAPI(config, cache.APIOptions{
+		CacheOptions: cache.CacheOptions{Logger: logger},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("unable to set up dmanager: %w", err)
+		return nil, err
+	}
+
+	apiServerConfig, err := apiserver.NewDefaultConfig("", apiServerPort, api.Client, true, false, logger)
+	if err != nil {
+		return nil, err
+	}
+	server, err = apiserver.NewAPIServer(apiServerConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	// Load the operator from file
 	errorChan := make(chan error, 16)
 	opts := doperator.Options{
+		Cache:        api.GetCache(),
 		ErrorChannel: errorChan,
+		APIServer:    server,
 		Logger:       logger,
 	}
 
-	if _, err := doperator.NewFromFile("sdwan-operator", config, specFile, opts); err != nil {
+	op, err := doperator.NewFromFile("sdwan-operator", config, specFile, opts)
+	if err != nil {
 		return nil, fmt.Errorf("unable to create SDWAN operator: %w", err)
 	}
 
@@ -81,25 +99,13 @@ func NewManager(ctx context.Context, specFile string, logger logr.Logger) (dmana
 	}
 
 	// Create the SD-WAN policy controller
-	if _, err := NewPolicyController(mgr, logger, *vManageConf); err != nil {
+	if _, err := NewPolicyController(op.GetManager(), logger, *vManageConf); err != nil {
 		return nil, fmt.Errorf("failed to create policy controller: %w", err)
 	}
 
 	log.Info("created SDWAN policy controller")
 
-	// Create an error reporter thread
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				os.Exit(1)
-			case err := <-errorChan:
-				log.Error(err, "operator error")
-			}
-		}
-	}()
-
-	return mgr, nil
+	return op, nil
 }
 
 // policyController implements the policy controller
@@ -233,6 +239,9 @@ func main() {
 
 	logger := zap.New(zap.UseFlagOptions(&zapOpts))
 	log := logger.WithName("setup")
+	slogHandler := logr.ToSlogHandler(log)
+	slog.SetDefault(slog.New(slogHandler))
+
 	if *dryRun {
 		log.Info("dry-run mode enabled")
 	}
@@ -245,15 +254,32 @@ func main() {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	mgr, err := NewManager(ctx, specFile, logger)
+	op, err := NewOperator(specFile, logger)
 	if err != nil {
 		log.Error(err, "problem running operator")
 		os.Exit(1)
 	}
 
-	if err := mgr.Start(ctx); err != nil {
+	go func() {
+		if err := server.Start(ctx); err != nil {
+			log.Error(err, "problem running operator")
+		}
+	}()
+
+	// Create an error reporter thread
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				os.Exit(1)
+			case err := <-op.GetErrorChannel():
+				log.Error(err, "operator error")
+			}
+		}
+	}()
+
+	if err := op.Start(ctx); err != nil {
 		log.Error(err, "problem running operator")
 		os.Exit(1)
 	}
-
 }
