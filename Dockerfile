@@ -1,5 +1,5 @@
-###########                                                                                              # Builder
-FROM docker.io/golang:1.25-alpine AS builder
+###########
+FROM docker.io/golang:1.26-alpine AS builder
 
 WORKDIR /build
 
