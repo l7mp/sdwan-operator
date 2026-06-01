@@ -37,7 +37,7 @@ controllers:
   # - create a unique service-id that will be used in gather
   # - demux on "$.endpoints"
   # - filter ready addresses
-  # - demux on $.endpoins.addresses
+  # - demux on $.endpoints.addresses
   # - gather into a single endpoint list per service-id
   # - convert into simpler shape
   - name: sdwan-tunnel-policy-controller

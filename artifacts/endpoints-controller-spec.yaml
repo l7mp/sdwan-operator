@@ -35,7 +35,7 @@ controllers:
   # - join services with the corresponding endpoint slices (service name has changed!)
   # - demux on "$.endpoints"
   # - filter ready addresses
-  # - demux on $.endpoins.addresses
+  # - demux on $.endpoints.addresses
   # - convert into simpler shape
   - name: sdwan-tunnel-policy-controller
     sources:
