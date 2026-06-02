@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 
 	"github.com/go-logr/logr"
 	"go.uber.org/zap/zapcore"
@@ -182,16 +182,34 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 			return reconcile.Result{}, nil
 		}
 
-		port := spec["targetPort"].(int64)
-		protocol := spec["protocol"].(string)
-		tunnel := spec["tunnel"].(string)
-		addresses, ok := spec["addresses"].([]interface{})
-		if !ok {
-			return reconcile.Result{}, errors.New("unable to parse endpoints from the spec")
+		port, err := getTargetPort(spec)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("unable to parse targetPort from spec: %w", err)
 		}
-		var endpoints []string
-		for _, val := range addresses {
-			endpoints = append(endpoints, fmt.Sprintf("%v", val))
+
+		protocol, ok, err := unstructured.NestedString(spec, "protocol")
+		if err != nil || !ok {
+			return reconcile.Result{}, fmt.Errorf("unable to parse protocol from spec: %v", err)
+		}
+
+		tunnel, ok, err := unstructured.NestedString(spec, "tunnel")
+		if err != nil || !ok {
+			return reconcile.Result{}, fmt.Errorf("unable to parse tunnel from spec: %v", err)
+		}
+
+		addresses, ok, err := unstructured.NestedSlice(spec, "addresses")
+		if err != nil || !ok {
+			return reconcile.Result{}, fmt.Errorf("unable to parse addresses from spec: %v", err)
+		}
+
+		endpoints := make([]string, 0, len(addresses))
+		for i, val := range addresses {
+			address, ok := val.(string)
+			if !ok {
+				return reconcile.Result{},
+					fmt.Errorf("unable to parse address %d from spec: expected string, got %T", i, val)
+			}
+			endpoints = append(endpoints, address)
 		}
 
 		err = r.sdwanManager.HandleUpsertEvent(namespace, name, endpoints, port, protocol, tunnel)
@@ -219,6 +237,36 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 	r.log.Info("Reconciliation done")
 
 	return reconcile.Result{}, nil
+}
+
+func getTargetPort(spec map[string]interface{}) (int64, error) {
+	if port, ok, err := unstructured.NestedInt64(spec, "targetPort"); err != nil {
+		return 0, err
+	} else if ok {
+		return port, nil
+	}
+
+	raw, ok := spec["targetPort"]
+	if !ok {
+		return 0, fmt.Errorf("field missing")
+	}
+
+	switch v := raw.(type) {
+	case int:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case float64:
+		return int64(v), nil
+	case string:
+		port, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return port, nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T", raw)
+	}
 }
 
 func main() {
