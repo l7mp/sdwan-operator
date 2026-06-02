@@ -19,6 +19,6 @@ helm install sdwan-operator sdwan-operator/sdwan-operator
 
 ## License
 
-Copyright 2025 by its authors. Some rights reserved. See [AUTHORS](https://github.com/l7mp/sdwan-operator/blob/main/AUTHORS).
+Copyright 2025-2026 by its authors. Some rights reserved. See [AUTHORS](https://github.com/l7mp/sdwan-operator/blob/main/AUTHORS).
 
 Apache License - see [LICENSE](https://github.com/l7mp/sdwan-operator/blob/main/LICENSE) for full text.
