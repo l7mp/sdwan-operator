@@ -1,6 +1,7 @@
-name: go: build and vet
+name: Build and go vet
 
 on:
+  workflow_dispatch:
   push:
     paths-ignore:
       - '**.md'
