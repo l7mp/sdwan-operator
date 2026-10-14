@@ -127,7 +127,10 @@ func (m *sdwanManager) refreshCache() error {
 	}
 	m.objectCache = cache
 
-	m.log.Info(fmt.Sprintf("object cache: %#v", m.objectCache))
+	// refreshed for every change: log the full cache only when asked to
+	m.log.Info("object cache refreshed", "vsmart", len(cache["central"]),
+		"dataprefix", len(cache["dataprefix"]), "approute", len(cache["approute"]))
+	m.log.V(1).Info(fmt.Sprintf("object cache: %#v", m.objectCache))
 
 	return nil
 }

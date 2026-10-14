@@ -912,6 +912,29 @@ func TestUpsertKeepsLegacyListVManageRefusesToDelete(t *testing.T) {
 	}
 }
 
+// The cache is refreshed for every change, and each refresh logged all of it.
+func TestRefreshCacheLogsCacheOnlyVerbose(t *testing.T) {
+	t.Parallel()
+	_, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	var mu sync.Mutex
+	var logs []string
+	m.log = funcr.New(func(_, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, args)
+	}, funcr.Options{})
+
+	if err := m.refreshCache(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if slices.ContainsFunc(logs, func(l string) bool { return strings.Contains(l, "object cache: map") }) {
+		t.Fatalf("full cache logged at the default verbosity: %q", logs)
+	}
+}
+
 func countCalls(calls []string, want string) int {
 	n := 0
 	for _, c := range calls {
