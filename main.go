@@ -2,21 +2,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/go-logr/logr"
 	"go.uber.org/zap/zapcore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -41,6 +45,8 @@ const (
 	SDWANConfigFile                 = "vmanage-config.yaml"
 	apiServerPort                   = 8443
 	maxPort                         = 65535
+	retryBaseDelay                  = time.Second
+	retryMaxDelay                   = 5 * time.Minute
 )
 
 var (
@@ -133,6 +139,9 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 	c, err := controller.NewTyped("sdwan-policy-controller", mgr, controller.TypedOptions[dreconciler.Request]{
 		SkipNameValidation: &on,
 		Reconciler:         r,
+		// Every attempt deactivates and activates the central policy, so
+		// retry far less eagerly than the 5ms default.
+		RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[dreconciler.Request](retryBaseDelay, retryMaxDelay),
 	})
 	if err != nil {
 		return nil, err
@@ -158,19 +167,37 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Request) (reconcile.Result, error) {
 	r.log.Info("Reconciling", "request", req.String())
 
+	if err := r.reconcileEvent(ctx, req); err != nil {
+		// A policy that cannot be applied as specified is not retried; any
+		// other error is, with backoff.
+		if errors.Is(err, sdwan.ErrInvalidSpec) {
+			err = reconcile.TerminalError(err)
+		}
+		return reconcile.Result{}, err
+	}
+
+	r.log.Info("Reconciliation done")
+
+	return reconcile.Result{}, nil
+}
+
+func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.Request) error {
 	// vManage update
 	switch req.EventType {
 	case object.Added, object.Updated, object.Upserted:
 		obj := object.NewViewObject("sdwan-operator", req.GVK.Kind)
 		if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj); err != nil {
-			r.log.Error(err, "failed to get added/updated object", "delta-type", req.EventType)
-			return reconcile.Result{}, err
+			if apierrors.IsNotFound(err) {
+				// deleted since: its delete event removes the SD-WAN resources
+				r.log.Info("SD-WAN tunnel policy gone, skipping", "name", req.Name, "namespace", req.Namespace)
+				return nil
+			}
+			return fmt.Errorf("failed to get added/updated object: %w", err)
 		}
 
 		spec, ok, err := unstructured.NestedMap(obj.Object, "spec")
 		if err != nil || !ok {
-			return reconcile.Result{},
-				fmt.Errorf("failed to look up added/updated object spec: %q", object.Dump(obj))
+			return fmt.Errorf("%w: failed to look up added/updated object spec: %q", sdwan.ErrInvalidSpec, object.Dump(obj))
 		}
 
 		name := obj.GetName()
@@ -181,42 +208,16 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 		// Must use endoint-pooling when using a real manager
 		if *dryRun || *disableEndpointPooling {
-			return reconcile.Result{}, nil
+			return nil
 		}
 
-		port, err := getTargetPort(spec)
+		port, protocol, tunnel, endpoints, err := parseSpec(spec)
 		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("unable to parse targetPort from spec: %w", err)
+			return fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
 		}
 
-		protocol, ok, err := unstructured.NestedString(spec, "protocol")
-		if err != nil || !ok {
-			return reconcile.Result{}, fmt.Errorf("unable to parse protocol from spec: %v", err)
-		}
-
-		tunnel, ok, err := unstructured.NestedString(spec, "tunnel")
-		if err != nil || !ok {
-			return reconcile.Result{}, fmt.Errorf("unable to parse tunnel from spec: %v", err)
-		}
-
-		addresses, ok, err := unstructured.NestedSlice(spec, "addresses")
-		if err != nil || !ok {
-			return reconcile.Result{}, fmt.Errorf("unable to parse addresses from spec: %v", err)
-		}
-
-		endpoints := make([]string, 0, len(addresses))
-		for i, val := range addresses {
-			address, ok := val.(string)
-			if !ok {
-				return reconcile.Result{},
-					fmt.Errorf("unable to parse address %d from spec: expected string, got %T", i, val)
-			}
-			endpoints = append(endpoints, address)
-		}
-
-		err = r.sdwanManager.HandleUpsertEvent(namespace, name, endpoints, port, protocol, tunnel)
-		if err != nil {
-			r.log.Error(err, "failed to upsert SD-WAN resources")
+		if err := r.sdwanManager.HandleUpsertEvent(namespace, name, endpoints, port, protocol, tunnel); err != nil {
+			return fmt.Errorf("failed to upsert SD-WAN resources: %w", err)
 		}
 
 	case object.Deleted:
@@ -224,21 +225,52 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 
 		// Must use endoint-pooling when using a real manager
 		if *dryRun || *disableEndpointPooling {
-			return reconcile.Result{}, nil
+			return nil
 		}
 
-		err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name)
-		if err != nil {
-			r.log.Error(err, "failed to delete SD-WAN resources")
+		if err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name); err != nil {
+			return fmt.Errorf("failed to delete SD-WAN resources: %w", err)
 		}
 
 	default:
 		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace, "type", req.EventType)
 	}
 
-	r.log.Info("Reconciliation done")
+	return nil
+}
 
-	return reconcile.Result{}, nil
+// parseSpec returns the fields of a tunnel policy spec.
+func parseSpec(spec map[string]interface{}) (port int64, protocol, tunnel string, endpoints []string, err error) {
+	port, err = getTargetPort(spec)
+	if err != nil {
+		return 0, "", "", nil, fmt.Errorf("unable to parse targetPort from spec: %w", err)
+	}
+
+	protocol, ok, err := unstructured.NestedString(spec, "protocol")
+	if err != nil || !ok {
+		return 0, "", "", nil, fmt.Errorf("unable to parse protocol from spec: %v", err)
+	}
+
+	tunnel, ok, err = unstructured.NestedString(spec, "tunnel")
+	if err != nil || !ok {
+		return 0, "", "", nil, fmt.Errorf("unable to parse tunnel from spec: %v", err)
+	}
+
+	addresses, ok, err := unstructured.NestedSlice(spec, "addresses")
+	if err != nil || !ok {
+		return 0, "", "", nil, fmt.Errorf("unable to parse addresses from spec: %v", err)
+	}
+
+	endpoints = make([]string, 0, len(addresses))
+	for i, val := range addresses {
+		address, ok := val.(string)
+		if !ok {
+			return 0, "", "", nil, fmt.Errorf("unable to parse address %d from spec: expected string, got %T", i, val)
+		}
+		endpoints = append(endpoints, address)
+	}
+
+	return port, protocol, tunnel, endpoints, nil
 }
 
 // getTargetPort returns the target port of a spec. A Service gives it as a
