@@ -39,6 +39,9 @@ type fakeVManage struct {
 	tasksBroken bool
 	// fail makes the API calls starting with this "METHOD path" fail.
 	fail string
+	// loginPageFor makes the API calls starting with this "METHOD path"
+	// return the login page, as after a session ends.
+	loginPageFor string
 	// listsBroken makes the object lists return the login page even with a
 	// valid session.
 	listsBroken bool
@@ -108,6 +111,11 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	f.calls = append(f.calls, r.Method+" "+path)
 	if f.fail != "" && strings.HasPrefix(r.Method+" "+path, f.fail) {
 		http.Error(w, "failing "+f.fail, http.StatusInternalServerError)
+		return
+	}
+	if f.loginPageFor != "" && strings.HasPrefix(r.Method+" "+path, f.loginPageFor) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, loginPage)
 		return
 	}
 	if (r.Method == http.MethodPost || r.Method == http.MethodPut) && len(body) > 0 && !json.Valid(body) {
@@ -794,6 +802,32 @@ func TestUpsertProtocolNumbers(t *testing.T) {
 			got := gjson.Get(f.approuteDefinition(), `sequences.#.match.entries.#(field=="protocol").value`).Array()
 			if len(got) != 2 || got[0].String() != want || got[1].String() != want {
 				t.Fatalf("protocol %s sent as %v, want %s", protocol, got, want)
+			}
+		})
+	}
+}
+
+// After a session ends, go-sdwan reports the login page as a success with an
+// empty body. A new list then got the id "", and an approute definition read
+// as empty was written back as only the new sequences.
+func TestUpsertChecksResponses(t *testing.T) {
+	t.Parallel()
+	for _, call := range []string{
+		"POST /template/policy/list/dataprefix/",
+		"GET /template/policy/definition/approute/",
+	} {
+		t.Run(call, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			f.loginPageFor = call
+			m := newTestManager(t, ts.URL)
+			def := f.approuteDefinition()
+
+			if err := upsert(m); !errors.Is(err, errInvalidResponse) {
+				t.Fatalf("expected errInvalidResponse, got %v", err)
+			}
+			if got := f.approuteDefinition(); got != def {
+				t.Fatalf("approute definition changed: %s", got)
 			}
 		})
 	}

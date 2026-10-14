@@ -288,6 +288,9 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 			m.log.Error(err, fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
 			return err
 		}
+		if res.Get("listId").String() == "" {
+			return fmt.Errorf("POST %s: %w", endpoint, errInvalidResponse)
+		}
 		m.objectCache["dataprefix"][objName] = res.Get("listId").String()
 		m.log.Info(fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
 	}
@@ -359,7 +362,16 @@ func (m *sdwanManager) filterSequenceRules(endpoint string, dataprefixIds ...str
 	if err != nil {
 		return "", err
 	}
+	// Writing back anything but the definition would replace it.
+	if !desc.Get("name").Exists() {
+		return "", fmt.Errorf("GET %s: %w", endpoint, errInvalidResponse)
+	}
 	data := desc.String()
+	if !desc.Get("sequences").IsArray() {
+		if data, err = sjson.SetRaw(data, "sequences", "[]"); err != nil {
+			return "", err
+		}
+	}
 	for _, dpid := range dataprefixIds {
 		s := gjson.Get(data, "sequences.#(match.entries.0.ref!=\""+dpid+"\")#")
 		if data, err = sjson.SetRaw(data, "sequences", s.String()); err != nil {
