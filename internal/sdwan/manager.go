@@ -91,14 +91,15 @@ func (m *sdwanManager) initCache() error {
 		return err
 	}
 
+	// ForEach stops when the callback returns false: skip the other policies.
 	p.Get("data").ForEach(func(key, val gjson.Result) bool {
 		if val.Get("policyName").String() == CentralizedPolicyName {
 			m.objectCache["central"] = map[string]string{
 				CentralizedPolicyName: val.Get("policyId").String(),
 			}
-			return true
+			return false
 		}
-		return false
+		return true
 	})
 
 	// dataprefix list

@@ -31,6 +31,8 @@ type fakeVManage struct {
 	// tasksBroken makes the task list return the login page even with a
 	// valid session.
 	tasksBroken bool
+	// vsmartPolicies is the data array of the vSmart policy list.
+	vsmartPolicies string
 	// calls lists "METHOD path" of the API calls made with a valid session.
 	calls []string
 }
@@ -97,6 +99,16 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		default:
 			_, _ = fmt.Fprint(w, `{"runningTasks":[]}`)
 		}
+	case r.Method == http.MethodGet && path == "/template/policy/vsmart":
+		policies := f.vsmartPolicies
+		if policies == "" {
+			policies = "[]"
+		}
+		_, _ = fmt.Fprint(w, `{"data":`+policies+`}`)
+	case r.Method == http.MethodGet && path == "/template/policy/list/dataprefix":
+		_, _ = fmt.Fprint(w, `{"data":[]}`)
+	case r.Method == http.MethodGet && path == "/template/policy/definition/approute":
+		_, _ = fmt.Fprint(w, `{"data":[{"name":"SDWANOperatorApproutePolicy","definitionId":"ar-1"}]}`)
 	case strings.HasPrefix(path, "/template/policy/vsmart/activate/"),
 		strings.HasPrefix(path, "/template/policy/vsmart/deactivate/"):
 		if f.noTaskID {
@@ -278,6 +290,39 @@ func TestToggleRequiresTaskID(t *testing.T) {
 
 	if err := m.toggleCentralPolicy(false); !errors.Is(err, errInvalidResponse) {
 		t.Fatalf("expected errInvalidResponse without a task id, got %v", err)
+	}
+}
+
+// initCache stopped at the first vSmart policy, so the operator's own policy
+// was found only when vManage listed it first.
+func TestInitCacheFindsCentralPolicy(t *testing.T) {
+	t.Parallel()
+	const other = `{"policyName":"OtherPolicy","policyId":"cp-other"}`
+	const own = `{"policyName":"` + CentralizedPolicyName + `","policyId":"cp-1"}`
+	for _, tc := range []struct {
+		name, policies string
+		found          bool
+	}{
+		{"first", "[" + own + "," + other + "]", true},
+		{"second", "[" + other + "," + own + "]", true},
+		{"last of three", "[" + other + "," + other + "," + own + "]", true},
+		{"missing", "[" + other + "]", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			f.vsmartPolicies = tc.policies
+			m := newTestManager(t, ts.URL)
+			m.objectCache = map[string]map[string]string{}
+
+			if err := m.initCache(); err != nil {
+				t.Fatal(err)
+			}
+			id, ok := m.objectCache["central"][CentralizedPolicyName]
+			if ok != tc.found || (tc.found && id != "cp-1") {
+				t.Fatalf("central policy id = %q (found %v), want cp-1 (found %v)", id, ok, tc.found)
+			}
+		})
 	}
 }
 
