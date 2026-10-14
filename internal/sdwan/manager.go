@@ -215,6 +215,11 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 		return err
 	}
 
+	// a change that cannot succeed must not toggle the central policy
+	if _, ok := m.objectCache["approute"][ApproutePolicyName]; !ok {
+		return errors.New("fail to get approute")
+	}
+
 	port := strconv.Itoa(int(targetPort))
 	proto := strconv.Itoa(int(protoNum))
 	legacyID := m.legacyListID(namespace, name)
@@ -230,9 +235,13 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 			return err
 		}
 
-		// the list from before names were hashed, now unused
+		// The list from before names were hashed is unused now. If vManage
+		// keeps it (e.g. another policy uses it), it routes nothing for us,
+		// so failing, and retrying, the change would not help.
 		if legacyID != "" {
-			return m.deleteDataPrefixList(legacyID)
+			if err := m.deleteDataPrefixList(legacyID); err != nil {
+				m.log.Error(err, "cannot delete legacy dataprefix list, leaving it", "id", legacyID)
+			}
 		}
 		return nil
 	})

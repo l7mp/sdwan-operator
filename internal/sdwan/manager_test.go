@@ -42,6 +42,8 @@ type fakeVManage struct {
 	// loginPageFor makes the API calls starting with this "METHOD path"
 	// return the login page, as after a session ends.
 	loginPageFor string
+	// noApproute leaves the operator's approute definition out of the list.
+	noApproute bool
 	// listsBroken makes the object lists return the login page even with a
 	// valid session.
 	listsBroken bool
@@ -154,6 +156,10 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		data, _ := json.Marshal(lists)
 		_, _ = fmt.Fprintf(w, `{"data":%s}`, data)
 	case r.Method == http.MethodGet && path == "/template/policy/definition/approute":
+		if f.noApproute {
+			_, _ = fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
 		_, _ = fmt.Fprint(w, `{"data":[{"name":"SDWANOperatorApproutePolicy","definitionId":"ar-1"}]}`)
 	case strings.HasPrefix(path, "/template/policy/vsmart/activate/"),
 		strings.HasPrefix(path, "/template/policy/vsmart/deactivate/"):
@@ -872,6 +878,37 @@ func TestDryRunRejectsInvalidSpec(t *testing.T) {
 	}
 	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "ICMP", "biz-internet"); !errors.Is(err, ErrInvalidSpec) {
 		t.Fatalf("dry run accepts an unknown protocol: %v", err)
+	}
+}
+
+// Changes that cannot succeed are retried: they must not toggle the central
+// policy, or fail for a leftover that does not matter.
+func TestUpsertThatCannotSucceedLeavesCentralPolicyAlone(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.noApproute = true
+	m := newTestManager(t, ts.URL)
+
+	if err := upsert(m); err == nil {
+		t.Fatal("expected an error without the approute definition")
+	}
+	if _, calls := f.state(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/policy/vsmart/") }) {
+		t.Fatalf("central policy toggled for a change that cannot succeed; calls: %q", calls)
+	}
+}
+
+func TestUpsertKeepsLegacyListVManageRefusesToDelete(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.addLegacyList(t, "default___llamacpp-b", "dp-legacy")
+	f.fail = "DELETE /template/policy/list/dataprefix/dp-legacy"
+	m := newTestManager(t, ts.URL)
+
+	if err := upsert(m); err != nil {
+		t.Fatalf("upsert failed for the legacy list: %v", err)
+	}
+	if f.usesList("dp-legacy") {
+		t.Fatalf("legacy list still routes: %s", f.approuteDefinition())
 	}
 }
 
