@@ -35,6 +35,8 @@ type fakeVManage struct {
 	// tasksBroken makes the task list return the login page even with a
 	// valid session.
 	tasksBroken bool
+	// fail makes the API calls starting with this "METHOD path" fail.
+	fail string
 	// listsBroken makes the object lists return the login page even with a
 	// valid session.
 	listsBroken bool
@@ -99,6 +101,10 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 
 	path := strings.TrimPrefix(r.URL.Path, "/dataservice")
 	f.calls = append(f.calls, r.Method+" "+path)
+	if f.fail != "" && strings.HasPrefix(r.Method+" "+path, f.fail) {
+		http.Error(w, "failing "+f.fail, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	isList := r.Method == http.MethodGet && (path == "/template/policy/vsmart" ||
 		path == "/template/policy/list/dataprefix" || path == "/template/policy/definition/approute")
@@ -497,6 +503,66 @@ func TestListsOfSimilarNamesStayApart(t *testing.T) {
 	}
 	if lists := f.lists(); len(lists) != 1 || lists[convertK8sNameToSdWan("default", "business-app-1")] != id1 {
 		t.Fatalf("business-app-1 lost its list: %v", lists)
+	}
+}
+
+// A change that failed after the central policy was deactivated returned
+// without activating it again, leaving the network-wide policy off.
+func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, fail string
+		delete     bool
+	}{
+		{"upsert, dataprefix list", "POST /template/policy/list/dataprefix/", false},
+		{"upsert, approute", "PUT /template/policy/definition/approute/", false},
+		{"delete, approute", "PUT /template/policy/definition/approute/", true},
+		{"delete, dataprefix list", "DELETE /template/policy/list/dataprefix/", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+			if tc.delete {
+				if err := upsert(m); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.mu.Lock()
+			f.fail = tc.fail
+			f.mu.Unlock()
+			_, before := f.state()
+
+			var err error
+			if tc.delete {
+				err = m.HandleDeleteEvent("default", "llamacpp-backends")
+			} else {
+				err = upsert(m)
+			}
+			if err == nil || !strings.Contains(err.Error(), "StatusCode 500") {
+				t.Fatalf("expected the failed call's error, got %v", err)
+			}
+			_, calls := f.state()
+			calls = calls[len(before):]
+			failed := slices.IndexFunc(calls, func(c string) bool { return strings.HasPrefix(c, tc.fail) })
+			if failed < 0 || !slices.Contains(calls[failed:], "POST /template/policy/vsmart/activate/cp-1") {
+				t.Fatalf("central policy not activated after the failed change; calls: %q", calls)
+			}
+		})
+	}
+}
+
+// A delete that cannot find its list must not touch the central policy.
+func TestDeleteOfUnknownListLeavesCentralPolicyAlone(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+
+	if err := m.HandleDeleteEvent("default", "unknown"); err == nil {
+		t.Fatal("expected an error for an unknown list")
+	}
+	if _, calls := f.state(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/policy/vsmart/") }) {
+		t.Fatalf("central policy toggled for an unknown list; calls: %q", calls)
 	}
 }
 

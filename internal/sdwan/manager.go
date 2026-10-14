@@ -127,10 +127,6 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 		return err
 	}
 
-	if err := m.deactivateCentralPolicy(); err != nil {
-		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue delete. err: %s", err))
-	}
-
 	// det dataprefixlist id
 	dpid, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
@@ -143,32 +139,30 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 		return errors.New("fail to get approute id")
 	}
 
-	endpoint := "/template/policy/definition/approute/" + id
-	data, err := m.filterSequenceRules(dpid, endpoint)
-	if err != nil {
-		return err
-	}
+	return m.applyChange("delete", func() error {
+		endpoint := "/template/policy/definition/approute/" + id
+		data, err := m.filterSequenceRules(dpid, endpoint)
+		if err != nil {
+			return err
+		}
 
-	res, err := m.client.Put(endpoint, data)
-	if err != nil {
-		return err
-	}
-	m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
+		res, err := m.client.Put(endpoint, data)
+		if err != nil {
+			return err
+		}
+		m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
 
-	// delete dataprefix
-	delete(m.objectCache["dataprefix"], objName)
-	endpoint = "/template/policy/list/dataprefix/" + dpid
-	res, err = m.client.Delete(endpoint)
-	if err != nil {
-		return err
-	}
-	m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
+		// delete dataprefix
+		delete(m.objectCache["dataprefix"], objName)
+		endpoint = "/template/policy/list/dataprefix/" + dpid
+		res, err = m.client.Delete(endpoint)
+		if err != nil {
+			return err
+		}
+		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
 
-	if err := m.activateCentralPolicy(); err != nil {
-		return err
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
@@ -182,28 +176,34 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 		return err
 	}
 
-	if err := m.deactivateCentralPolicy(); err != nil {
-		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue upsert. err: %s", err))
-	}
-
-	// dataprefix
-	if err := m.upsertDataPrefixList(objName, endpoints); err != nil {
-		return err
-	}
-
-	// approute
 	port := strconv.Itoa(int(targetPort))
 	proto := strconv.Itoa(int(protocolNumbers[protocol]))
 
-	if err := m.updateApproute(objName, port, proto, tunnel); err != nil {
-		return err
+	return m.applyChange("upsert", func() error {
+		// dataprefix
+		if err := m.upsertDataPrefixList(objName, endpoints); err != nil {
+			return err
+		}
+
+		// approute
+		return m.updateApproute(objName, port, proto, tunnel)
+	})
+}
+
+// applyChange makes a change while the central policy is deactivated. The
+// policy is activated again even if the change fails, so that a failed change
+// cannot leave the network-wide policy off.
+func (m *sdwanManager) applyChange(op string, change func() error) error {
+	if err := m.deactivateCentralPolicy(); err != nil {
+		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue %s. err: %s", op, err))
 	}
 
-	if err := m.activateCentralPolicy(); err != nil {
-		return err
+	err := change()
+	if aerr := m.activateCentralPolicy(); aerr != nil {
+		return errors.Join(err, aerr)
 	}
 
-	return nil
+	return err
 }
 
 func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) error {
