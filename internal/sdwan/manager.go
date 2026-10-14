@@ -146,7 +146,8 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 		dpids = append(dpids, dpid)
 	}
 	if len(dpids) == 0 {
-		return errors.New("fail to get dataprefix id")
+		m.log.Info("no dataprefix list to delete", "name", objName)
+		return nil
 	}
 
 	// update approte seq rules
@@ -181,6 +182,12 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
+
+	// Without endpoints there is nothing to route: remove the service's list
+	// rather than sending vManage an empty one.
+	if len(endpoints) == 0 {
+		return m.HandleDeleteEvent(namespace, name)
+	}
 
 	if !tunnelRe.MatchString(tunnel) {
 		return fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)

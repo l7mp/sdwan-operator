@@ -597,14 +597,15 @@ func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
 	}
 }
 
-// A delete that cannot find its list must not touch the central policy.
+// A delete of a service without a list has nothing to do: it must succeed,
+// so that it is not retried, and not touch the central policy.
 func TestDeleteOfUnknownListLeavesCentralPolicyAlone(t *testing.T) {
 	t.Parallel()
 	f, ts := newFakeVManage(t)
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleDeleteEvent("default", "unknown"); err == nil {
-		t.Fatal("expected an error for an unknown list")
+	if err := m.HandleDeleteEvent("default", "unknown"); err != nil {
+		t.Fatalf("delete of a service without a list: %v", err)
 	}
 	if _, calls := f.state(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/policy/vsmart/") }) {
 		t.Fatalf("central policy toggled for an unknown list; calls: %q", calls)
@@ -752,6 +753,27 @@ func TestShortNamesHaveNoLegacyList(t *testing.T) {
 	}
 	if _, ok := f.lists()["default___app-backend"]; !ok || !f.usesList("dp-other") {
 		t.Fatalf("another service's list was touched: %v", f.lists())
+	}
+}
+
+// An empty endpoint list made generateDataPrefixList panic. A service without
+// endpoints must lose its list and sequences instead.
+func TestUpsertWithoutEndpointsRemovesList(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	if err := upsert(m); err != nil {
+		t.Fatal(err)
+	}
+	id := f.lists()[convertK8sNameToSdWan("default", "llamacpp-backends")]
+
+	for i := range 2 { // the second time there is nothing left to remove
+		if err := m.HandleUpsertEvent("default", "llamacpp-backends", []string{}, 50052, "TCP", "biz-internet"); err != nil {
+			t.Fatalf("upsert %d without endpoints: %v", i+1, err)
+		}
+		if lists := f.lists(); len(lists) != 0 || f.usesList(id) {
+			t.Fatalf("list not removed: lists %v, approute %s", lists, f.approuteDefinition())
+		}
 	}
 }
 
