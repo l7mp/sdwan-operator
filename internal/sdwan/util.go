@@ -14,13 +14,26 @@ const (
 )
 
 // convertK8sNameToSdWan returns the vManage list name of a Kubernetes object.
-// A name longer than maxListNameLen is cut short and ends in a hash of the full
-// name, so that vManage keeps it whole and it stays unique.
+// A name of maxListNameLen or more characters is cut short and ends in a hash
+// of the full name, so that vManage keeps it whole and it stays unique. Even a
+// name of exactly maxListNameLen characters is hashed, so that it cannot be
+// taken for the legacy name of a longer one (see legacyListName).
 func convertK8sNameToSdWan(namespace, name string) string {
 	n := namespace + nameSeparator + name
-	if len(n) <= maxListNameLen {
+	if len(n) < maxListNameLen {
 		return n
 	}
 	sum := sha256.Sum256([]byte(n))
 	return n[:maxListNameLen-nameHashLen-1] + "_" + hex.EncodeToString(sum[:])[:nameHashLen]
+}
+
+// legacyListName returns the name vManage kept for the list of a Kubernetes
+// object before names were hashed: the full name, truncated to
+// maxListNameLen. Shorter names have not changed.
+func legacyListName(namespace, name string) (string, bool) {
+	n := namespace + nameSeparator + name
+	if len(n) < maxListNameLen {
+		return "", false
+	}
+	return n[:maxListNameLen], true
 }

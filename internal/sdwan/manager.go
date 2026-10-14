@@ -137,9 +137,15 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 		return err
 	}
 
-	// det dataprefixlist id
-	dpid, ok := m.objectCache["dataprefix"][objName]
-	if !ok {
+	// det dataprefixlist ids
+	var dpids []string
+	if dpid, ok := m.objectCache["dataprefix"][objName]; ok {
+		dpids = append(dpids, dpid)
+	}
+	if dpid := m.legacyListID(namespace, name); dpid != "" {
+		dpids = append(dpids, dpid)
+	}
+	if len(dpids) == 0 {
 		return errors.New("fail to get dataprefix id")
 	}
 
@@ -151,7 +157,7 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 
 	return m.applyChange("delete", func() error {
 		endpoint := "/template/policy/definition/approute/" + id
-		data, err := m.filterSequenceRules(dpid, endpoint)
+		data, err := m.filterSequenceRules(endpoint, dpids...)
 		if err != nil {
 			return err
 		}
@@ -163,13 +169,11 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 		m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
 
 		// delete dataprefix
-		delete(m.objectCache["dataprefix"], objName)
-		endpoint = "/template/policy/list/dataprefix/" + dpid
-		res, err = m.client.Delete(endpoint)
-		if err != nil {
-			return err
+		for _, dpid := range dpids {
+			if err := m.deleteDataPrefixList(dpid); err != nil {
+				return err
+			}
 		}
-		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
 
 		return nil
 	})
@@ -181,7 +185,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 	if !tunnelRe.MatchString(tunnel) {
 		return fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
 	}
-	dataPrefixList, err := m.generateDataPrefixList(objName, endpoints)
+	listData, err := m.generateDataPrefixList(objName, endpoints)
 	if err != nil {
 		return err
 	}
@@ -196,16 +200,45 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 
 	port := strconv.Itoa(int(targetPort))
 	proto := strconv.Itoa(int(protocolNumbers[protocol]))
+	legacyID := m.legacyListID(namespace, name)
 
 	return m.applyChange("upsert", func() error {
 		// dataprefix
-		if err := m.upsertDataPrefixList(objName, dataPrefixList); err != nil {
+		if err := m.upsertDataPrefixList(objName, listData); err != nil {
 			return err
 		}
 
 		// approute
-		return m.updateApproute(objName, port, proto, tunnel)
+		if err := m.updateApproute(objName, port, proto, tunnel, legacyID); err != nil {
+			return err
+		}
+
+		// the list from before names were hashed, now unused
+		if legacyID != "" {
+			return m.deleteDataPrefixList(legacyID)
+		}
+		return nil
 	})
+}
+
+// legacyListID returns the id of the list a Kubernetes object has in vManage
+// from before names were hashed, or "" if it has none.
+func (m *sdwanManager) legacyListID(namespace, name string) string {
+	legacy, ok := legacyListName(namespace, name)
+	if !ok {
+		return ""
+	}
+	return m.objectCache["dataprefix"][legacy]
+}
+
+func (m *sdwanManager) deleteDataPrefixList(id string) error {
+	endpoint := "/template/policy/list/dataprefix/" + id
+	res, err := m.client.Delete(endpoint)
+	if err != nil {
+		return err
+	}
+	m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
+	return nil
 }
 
 // applyChange makes a change while the central policy is deactivated. The
@@ -248,7 +281,9 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 	return nil
 }
 
-func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error {
+// updateApproute replaces the approute sequences of a dataprefix list, and
+// removes those of the legacy list with the id legacyID, unless that is "".
+func (m *sdwanManager) updateApproute(objName, port, proto, tunnel, legacyID string) error {
 	dataPrefixList, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
 		return errors.New("fail to get dataprefix")
@@ -261,7 +296,11 @@ func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error
 
 	// get approute without existing seq rules matchin on the dataprefix
 	endpoint := "/template/policy/definition/approute/" + id
-	desc, err := m.filterSequenceRules(dataPrefixList, endpoint)
+	stale := []string{dataPrefixList}
+	if legacyID != "" {
+		stale = append(stale, legacyID)
+	}
+	desc, err := m.filterSequenceRules(endpoint, stale...)
 	if err != nil {
 		return err
 	}
@@ -299,15 +338,19 @@ func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error
 	return nil
 }
 
-func (m *sdwanManager) filterSequenceRules(dataprefixId, endpoint string) (string, error) {
+// filterSequenceRules returns the approute definition at endpoint without the
+// sequences that match on any of the dataprefix lists.
+func (m *sdwanManager) filterSequenceRules(endpoint string, dataprefixIds ...string) (string, error) {
 	desc, err := m.client.Get(endpoint)
 	if err != nil {
 		return "", err
 	}
-	s := gjson.Get(desc.String(), "sequences.#(match.entries.0.ref!=\""+dataprefixId+"\")#")
-	data, err := sjson.SetRaw(desc.String(), "sequences", s.String())
-	if err != nil {
-		return "", err
+	data := desc.String()
+	for _, dpid := range dataprefixIds {
+		s := gjson.Get(data, "sequences.#(match.entries.0.ref!=\""+dpid+"\")#")
+		if data, err = sjson.SetRaw(data, "sequences", s.String()); err != nil {
+			return "", err
+		}
 	}
 
 	return data, nil

@@ -19,6 +19,7 @@ import (
 	"github.com/go-logr/logr/funcr"
 	"github.com/netascode/go-sdwan"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // fakeVManage imitates the parts of the vManage API the manager uses,
@@ -174,6 +175,10 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == http.MethodDelete {
+			if gjson.Get(f.approute, `sequences.#(match.entries.0.ref=="`+id+`")`).Exists() {
+				http.Error(w, "dataprefix list "+id+" is in use", http.StatusBadRequest)
+				return
+			}
 			delete(f.dataPrefixLists, name)
 		}
 		_, _ = fmt.Fprint(w, `{}`)
@@ -214,6 +219,31 @@ func (f *fakeVManage) lists() map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return maps.Clone(f.dataPrefixLists)
+}
+
+// addLegacyList adds a dataprefix list from before names were hashed, with
+// approute sequences that use it.
+func (f *fakeVManage) addLegacyList(t *testing.T, name, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dataPrefixLists[name] = id
+	for i, direction := range []string{"source", "destination"} {
+		rule, err := generateSeqRule(100+i, direction, id, "80", "6", "mpls")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.approute, err = sjson.SetRaw(f.approute, "sequences.-1", rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// usesList tells if an approute sequence matches on the dataprefix list id.
+func (f *fakeVManage) usesList(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return gjson.Get(f.approute, `sequences.#(match.entries.0.ref=="`+id+`")`).Exists()
 }
 
 func (f *fakeVManage) approuteDefinition() string {
@@ -666,6 +696,62 @@ func TestUpsertRejectsInvalidSpec(t *testing.T) {
 				t.Fatalf("vManage called for an invalid spec: %q", calls)
 			}
 		})
+	}
+}
+
+// Before names were hashed, vManage kept long list names truncated to 20
+// characters. Those lists and their approute sequences must be removed once
+// the service has a list under its new name, or when the service is deleted.
+func TestLegacyListsAreRemoved(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, service, legacy string
+		delete                bool
+	}{
+		{"upsert, long name", "llamacpp-backends", "default___llamacpp-b", false},
+		{"upsert, name of exactly 20 characters", "business-a", "default___business-a", false},
+		{"delete, long name", "llamacpp-backends", "default___llamacpp-b", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			f.addLegacyList(t, tc.legacy, "dp-legacy")
+			m := newTestManager(t, ts.URL)
+
+			var err error
+			if tc.delete {
+				err = m.HandleDeleteEvent("default", tc.service)
+			} else {
+				err = m.HandleUpsertEvent("default", tc.service, []string{"10.0.0.1"}, 8080, "TCP", "biz-internet")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			lists := f.lists()
+			if _, ok := lists[tc.legacy]; ok || f.usesList("dp-legacy") {
+				t.Fatalf("legacy list not removed: lists %v, approute %s", lists, f.approuteDefinition())
+			}
+			newID, ok := lists[convertK8sNameToSdWan("default", tc.service)]
+			if tc.delete == ok || (!tc.delete && !f.usesList(newID)) {
+				t.Fatalf("service list wrong after the change: lists %v, approute %s", lists, f.approuteDefinition())
+			}
+		})
+	}
+}
+
+// A service with a short name never had a legacy list: another service's
+// lists must be left alone.
+func TestShortNamesHaveNoLegacyList(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.addLegacyList(t, "default___app-backend", "dp-other")
+	m := newTestManager(t, ts.URL)
+
+	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.lists()["default___app-backend"]; !ok || !f.usesList("dp-other") {
+		t.Fatalf("another service's list was touched: %v", f.lists())
 	}
 }
 
