@@ -60,7 +60,7 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 	}
 
 	//populate SDWAN cache
-	err = m.initCache()
+	err = m.refreshCache()
 	if err != nil {
 		return nil, err
 	}
@@ -84,47 +84,32 @@ type sdwanManager struct {
 	taskPollInterval time.Duration
 }
 
-func (m *sdwanManager) initCache() error {
-	// central policy
-	p, err := m.client.Get("/template/policy/vsmart")
-	if err != nil {
-		return err
-	}
-
-	// ForEach stops when the callback returns false: skip the other policies.
-	p.Get("data").ForEach(func(key, val gjson.Result) bool {
-		if val.Get("policyName").String() == CentralizedPolicyName {
-			m.objectCache["central"] = map[string]string{
-				CentralizedPolicyName: val.Get("policyId").String(),
-			}
-			return false
+// refreshCache reloads the IDs of the vManage objects the operator uses, so
+// that changes made in vManage since the last event, like a list deleted or
+// recreated by hand, are seen. The cache is replaced only if every list was
+// read: a response without a data array (e.g. the login page of an expired
+// session) is errInvalidResponse.
+func (m *sdwanManager) refreshCache() error {
+	cache := make(map[string]map[string]string)
+	for _, l := range []struct{ kind, endpoint, nameField, idField string }{
+		{"central", "/template/policy/vsmart", "policyName", "policyId"},
+		{"dataprefix", "/template/policy/list/dataprefix", "name", "listId"},
+		{"approute", "/template/policy/definition/approute", "name", "definitionId"},
+	} {
+		res, err := m.client.Get(l.endpoint)
+		if err != nil {
+			return err
 		}
-		return true
-	})
-
-	// dataprefix list
-	dp, err := m.client.Get("/template/policy/list/dataprefix")
-	if err != nil {
-		return err
+		data := res.Get("data")
+		if !data.IsArray() {
+			return fmt.Errorf("GET %s: %w", l.endpoint, errInvalidResponse)
+		}
+		cache[l.kind] = make(map[string]string)
+		for _, val := range data.Array() {
+			cache[l.kind][val.Get(l.nameField).String()] = val.Get(l.idField).String()
+		}
 	}
-
-	m.objectCache["dataprefix"] = make(map[string]string)
-	dp.Get("data").ForEach(func(key, val gjson.Result) bool {
-		m.objectCache["dataprefix"][val.Get("name").String()] = val.Get("listId").String()
-		return true
-	})
-
-	//approute list
-	ar, err := m.client.Get("/template/policy/definition/approute")
-	if err != nil {
-		return err
-	}
-
-	m.objectCache["approute"] = make(map[string]string)
-	ar.Get("data").ForEach(func(key, val gjson.Result) bool {
-		m.objectCache["approute"][val.Get("name").String()] = val.Get("definitionId").String()
-		return true
-	})
+	m.objectCache = cache
 
 	m.log.Info(fmt.Sprintf("object cache: %#v", m.objectCache))
 
@@ -135,6 +120,10 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
 	if err := m.ensureSession(); err != nil {
+		return err
+	}
+
+	if err := m.refreshCache(); err != nil {
 		return err
 	}
 
@@ -187,6 +176,10 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 	objName := convertK8sNameToSdWan(namespace, name)
 
 	if err := m.ensureSession(); err != nil {
+		return err
+	}
+
+	if err := m.refreshCache(); err != nil {
 		return err
 	}
 

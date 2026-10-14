@@ -1,11 +1,13 @@
 package sdwan
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/netascode/go-sdwan"
+	"github.com/tidwall/gjson"
 )
 
 // fakeVManage imitates the parts of the vManage API the manager uses,
@@ -31,8 +34,14 @@ type fakeVManage struct {
 	// tasksBroken makes the task list return the login page even with a
 	// valid session.
 	tasksBroken bool
+	// listsBroken makes the object lists return the login page even with a
+	// valid session.
+	listsBroken bool
 	// vsmartPolicies is the data array of the vSmart policy list.
 	vsmartPolicies string
+	// dataPrefixLists maps the dataprefix lists by name to their id.
+	dataPrefixLists map[string]string
+	nextList        int
 	// calls lists "METHOD path" of the API calls made with a valid session.
 	calls []string
 }
@@ -41,7 +50,11 @@ const loginPage = "<html><head><title>Cisco vManage</title></head><body>login</b
 
 func newFakeVManage(t *testing.T) (*fakeVManage, *httptest.Server) {
 	t.Helper()
-	f := &fakeVManage{sessions: map[string]bool{}}
+	f := &fakeVManage{
+		sessions:        map[string]bool{},
+		vsmartPolicies:  `[{"policyName":"` + CentralizedPolicyName + `","policyId":"cp-1"}]`,
+		dataPrefixLists: map[string]string{},
+	}
 	ts := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(ts.Close)
 	return f, ts
@@ -57,7 +70,7 @@ func (f *fakeVManage) expire() {
 func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_, _ = io.Copy(io.Discard, r.Body)
+	body, _ := io.ReadAll(r.Body)
 
 	if r.Method == http.MethodPost && r.URL.Path == "/j_security_check" {
 		f.next++
@@ -85,6 +98,13 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/dataservice")
 	f.calls = append(f.calls, r.Method+" "+path)
 	w.Header().Set("Content-Type", "application/json")
+	isList := r.Method == http.MethodGet && (path == "/template/policy/vsmart" ||
+		path == "/template/policy/list/dataprefix" || path == "/template/policy/definition/approute")
+	if f.listsBroken && isList {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, loginPage)
+		return
+	}
 	switch {
 	case path == "/client/about":
 		_, _ = fmt.Fprint(w, `{"data":{"version":"20.15.6"}}`)
@@ -100,13 +120,14 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 			_, _ = fmt.Fprint(w, `{"runningTasks":[]}`)
 		}
 	case r.Method == http.MethodGet && path == "/template/policy/vsmart":
-		policies := f.vsmartPolicies
-		if policies == "" {
-			policies = "[]"
-		}
-		_, _ = fmt.Fprint(w, `{"data":`+policies+`}`)
+		_, _ = fmt.Fprint(w, `{"data":`+f.vsmartPolicies+`}`)
 	case r.Method == http.MethodGet && path == "/template/policy/list/dataprefix":
-		_, _ = fmt.Fprint(w, `{"data":[]}`)
+		lists := []map[string]string{}
+		for name, id := range f.dataPrefixLists {
+			lists = append(lists, map[string]string{"name": name, "listId": id})
+		}
+		data, _ := json.Marshal(lists)
+		_, _ = fmt.Fprintf(w, `{"data":%s}`, data)
 	case r.Method == http.MethodGet && path == "/template/policy/definition/approute":
 		_, _ = fmt.Fprint(w, `{"data":[{"name":"SDWANOperatorApproutePolicy","definitionId":"ar-1"}]}`)
 	case strings.HasPrefix(path, "/template/policy/vsmart/activate/"),
@@ -117,8 +138,20 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprint(w, `{"id":"vsmart_policy_config-1"}`)
 	case r.Method == http.MethodPost && path == "/template/policy/list/dataprefix/":
-		_, _ = fmt.Fprint(w, `{"listId":"dp-1"}`)
+		f.nextList++
+		id := fmt.Sprintf("dp-%d", f.nextList)
+		f.dataPrefixLists[gjson.GetBytes(body, "name").String()] = id
+		_, _ = fmt.Fprintf(w, `{"listId":%q}`, id)
 	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && strings.HasPrefix(path, "/template/policy/list/dataprefix/"):
+		id := strings.TrimPrefix(path, "/template/policy/list/dataprefix/")
+		name, ok := f.dataPrefixListName(id)
+		if !ok {
+			http.Error(w, "no dataprefix list "+id, http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			delete(f.dataPrefixLists, name)
+		}
 		_, _ = fmt.Fprint(w, `{}`)
 	case strings.HasPrefix(path, "/template/policy/definition/approute/"):
 		if r.Method == http.MethodGet {
@@ -129,6 +162,27 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unexpected "+r.Method+" "+path, http.StatusNotFound)
 	}
+}
+
+func (f *fakeVManage) dataPrefixListName(id string) (string, bool) {
+	for name, listID := range f.dataPrefixLists {
+		if listID == id {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// setDataPrefixList changes a dataprefix list behind the operator's back, like
+// an edit in the vManage UI. An empty id deletes the list.
+func (f *fakeVManage) setDataPrefixList(name, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id == "" {
+		delete(f.dataPrefixLists, name)
+		return
+	}
+	f.dataPrefixLists[name] = id
 }
 
 func (f *fakeVManage) state() (logins int, calls []string) {
@@ -293,9 +347,9 @@ func TestToggleRequiresTaskID(t *testing.T) {
 	}
 }
 
-// initCache stopped at the first vSmart policy, so the operator's own policy
-// was found only when vManage listed it first.
-func TestInitCacheFindsCentralPolicy(t *testing.T) {
+// Reading the cache stopped at the first vSmart policy, so the operator's own
+// policy was found only when vManage listed it first.
+func TestRefreshCacheFindsCentralPolicy(t *testing.T) {
 	t.Parallel()
 	const other = `{"policyName":"OtherPolicy","policyId":"cp-other"}`
 	const own = `{"policyName":"` + CentralizedPolicyName + `","policyId":"cp-1"}`
@@ -315,7 +369,7 @@ func TestInitCacheFindsCentralPolicy(t *testing.T) {
 			m := newTestManager(t, ts.URL)
 			m.objectCache = map[string]map[string]string{}
 
-			if err := m.initCache(); err != nil {
+			if err := m.refreshCache(); err != nil {
 				t.Fatal(err)
 			}
 			id, ok := m.objectCache["central"][CentralizedPolicyName]
@@ -323,6 +377,70 @@ func TestInitCacheFindsCentralPolicy(t *testing.T) {
 				t.Fatalf("central policy id = %q (found %v), want cp-1 (found %v)", id, ok, tc.found)
 			}
 		})
+	}
+}
+
+// The object cache was read only at startup, so a dataprefix list deleted or
+// recreated in vManage left a stale id behind: the next update went to a list
+// that no longer existed.
+func TestUpsertSeesListsChangedInVManage(t *testing.T) {
+	t.Parallel()
+	const name = "default___llamacpp-backends"
+	for _, tc := range []struct {
+		name, newID, want string
+	}{
+		{"deleted", "", "POST /template/policy/list/dataprefix/"},
+		{"recreated", "dp-ui", "PUT /template/policy/list/dataprefix/dp-ui"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+			if err := upsert(m); err != nil {
+				t.Fatalf("first upsert: %v", err)
+			}
+			_, before := f.state()
+			f.setDataPrefixList(name, tc.newID)
+
+			if err := upsert(m); err != nil {
+				t.Fatalf("upsert after the list changed in vManage: %v", err)
+			}
+			_, calls := f.state()
+			calls = calls[len(before):]
+			if !slices.Contains(calls, tc.want) {
+				t.Fatalf("%q not called; calls: %q", tc.want, calls)
+			}
+			if slices.Contains(calls, "PUT /template/policy/list/dataprefix/dp-1") {
+				t.Fatalf("update sent to the stale list id; calls: %q", calls)
+			}
+		})
+	}
+}
+
+// A cache refresh that reads the login page instead of a list must not empty
+// the cache, which would make the operator create duplicate lists.
+func TestUpsertFailsBeforeChangesWhenListsCannotBeRead(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	if err := upsert(m); err != nil {
+		t.Fatal(err)
+	}
+	_, before := f.state()
+	cache := m.objectCache
+	f.mu.Lock()
+	f.listsBroken = true
+	f.mu.Unlock()
+
+	if err := upsert(m); !errors.Is(err, errInvalidResponse) {
+		t.Fatalf("expected errInvalidResponse, got %v", err)
+	}
+	_, calls := f.state()
+	if calls = calls[len(before):]; slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/") || strings.HasPrefix(c, "PUT ") }) {
+		t.Fatalf("changes made despite unreadable lists: %q", calls)
+	}
+	if !reflect.DeepEqual(m.objectCache, cache) {
+		t.Fatalf("cache changed by a failed refresh: %#v, was %#v", m.objectCache, cache)
 	}
 }
 
