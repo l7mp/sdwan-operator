@@ -468,8 +468,15 @@ func run(ctx context.Context, log logr.Logger, startOp, startServer func(context
 	}()
 
 	err := startOp(ctx)
-	if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) {
+	switch cause := context.Cause(ctx); {
+	case cause == nil:
+	case !errors.Is(cause, context.Canceled):
 		err = errors.Join(err, cause)
+	case err != nil:
+		// Shutting down: stopping fails when a change outlasts the manager's
+		// grace period, but the change is waited for below.
+		log.Error(err, "operator did not stop cleanly")
+		err = nil
 	}
 	if !waitChanges(timeout) {
 		err = errors.Join(err, fmt.Errorf("SD-WAN change still in progress after %s", timeout))

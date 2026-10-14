@@ -380,3 +380,28 @@ func TestReconcileGivesUpEventually(t *testing.T) {
 		}
 	}
 }
+
+// A shutdown during a long change returned the manager's grace period error,
+// so the operator exited 1 even though the change finished.
+func TestRunShutdownIgnoresStopError(t *testing.T) {
+	t.Parallel()
+	r := &policyController{}
+	stopLate := func(ctx context.Context) error {
+		<-ctx.Done()
+		return errors.New("failed waiting for all runnables to end within grace period")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, logr.Discard(), stopLate, blockUntilDone, make(chan error), r.waitChanges, time.Second)
+	}()
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("run after a clean shutdown: %v", err)
+	}
+	failStart := func(context.Context) error { return errors.New("cannot start") }
+	if err := run(context.Background(), logr.Discard(), failStart, blockUntilDone, make(chan error), (&policyController{}).waitChanges, time.Second); err == nil {
+		t.Fatal("start failure not reported")
+	}
+}
