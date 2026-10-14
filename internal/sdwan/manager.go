@@ -1,11 +1,13 @@
 package sdwan
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,6 +31,14 @@ const (
 // every request gets HTTP 200 with the HTML login page, which go-sdwan
 // reports as success with an empty body.
 var errInvalidResponse = errors.New("unexpected vManage response (session expired?)")
+
+// ErrInvalidSpec is returned for a tunnel policy that cannot be applied as
+// specified, so retrying it does not help.
+var ErrInvalidSpec = errors.New("invalid tunnel policy")
+
+// tunnelRe matches one or more vManage colors (e.g. "biz-internet mpls"), the
+// parameter of the backupSlaPreferredColor action.
+var tunnelRe = regexp.MustCompile(`^[a-z0-9-]+( [a-z0-9-]+)*$`)
 
 var protocolNumbers = map[string]int32{
 	"TCP": 6,
@@ -168,6 +178,14 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
+	if !tunnelRe.MatchString(tunnel) {
+		return fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
+	}
+	dataPrefixList, err := m.generateDataPrefixList(objName, endpoints)
+	if err != nil {
+		return err
+	}
+
 	if err := m.ensureSession(); err != nil {
 		return err
 	}
@@ -181,7 +199,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 
 	return m.applyChange("upsert", func() error {
 		// dataprefix
-		if err := m.upsertDataPrefixList(objName, endpoints); err != nil {
+		if err := m.upsertDataPrefixList(objName, dataPrefixList); err != nil {
 			return err
 		}
 
@@ -206,8 +224,7 @@ func (m *sdwanManager) applyChange(op string, change func() error) error {
 	return err
 }
 
-func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) error {
-	data := m.generateDataPrefixList(objName, endpoints)
+func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 	endpoint := "/template/policy/list/dataprefix/"
 	id, ok := m.objectCache["dataprefix"][objName]
 	if ok {
@@ -261,16 +278,15 @@ func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error
 	}
 
 	// install new seqrules
-	dataSrc := m.generateSeqRule(strconv.Itoa(sid), "sourceDataPrefixList", dataPrefixList, "source", port, proto, tunnel)
-	dataDst := m.generateSeqRule(strconv.Itoa(sid+1), "destinationDataPrefixList", dataPrefixList, "destination", port, proto, tunnel)
-
-	data, err := sjson.SetRaw(desc, "sequences.-1", dataSrc)
-	if err != nil {
-		return err
-	}
-	data, err = sjson.SetRaw(data, "sequences.-1", dataDst)
-	if err != nil {
-		return err
+	data := desc
+	for i, direction := range []string{"source", "destination"} {
+		rule, err := generateSeqRule(sid+i, direction, dataPrefixList, port, proto, tunnel)
+		if err != nil {
+			return err
+		}
+		if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
+			return err
+		}
 	}
 
 	res, err := m.client.Put(endpoint, data)
@@ -297,17 +313,77 @@ func (m *sdwanManager) filterSequenceRules(dataprefixId, endpoint string) (strin
 	return data, nil
 }
 
-func (m *sdwanManager) generateSeqRule(id, prefixListType, dataPrefixList, direction, port, proto, tunnel string) string {
-	return "{\"sequenceId\": " + id + ", \"sequenceName\": \"App Route\", \"sequenceType\": \"appRoute\", \"sequenceIpType\": \"ipv4\", \"match\": {\"entries\": [{\"field\": \"" + prefixListType + "\", \"ref\": \"" + dataPrefixList + "\"}, {\"field\": \"" + direction + "Port\", \"value\": \"" + port + "\"}, {\"field\": \"protocol\", \"value\": \"" + proto + "\"}]}, \"actions\": [{\"type\": \"backupSlaPreferredColor\", \"parameter\": \"" + tunnel + "\"}]}]}"
+type matchEntry struct {
+	Field string `json:"field"`
+	Ref   string `json:"ref,omitempty"`
+	Value string `json:"value,omitempty"`
 }
 
-func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) string {
-	prefixes := make([]string, 0, len(endpoints)-1)
-	for _, val := range endpoints {
-		prefixes = append(prefixes, "{ \"ipPrefix\": \""+val+"/32\"}")
-	}
+type seqAction struct {
+	Type      string `json:"type"`
+	Parameter string `json:"parameter"`
+}
 
-	return "{\"name\": \"" + name + "\", \"description\": \"" + defaultDescription + "\", \"type\": \"dataPrefix\", \"entries\": [" + strings.Join(prefixes, ",") + "]}"
+type seqRule struct {
+	SequenceID     int    `json:"sequenceId"`
+	SequenceName   string `json:"sequenceName"`
+	SequenceType   string `json:"sequenceType"`
+	SequenceIPType string `json:"sequenceIpType"`
+	Match          struct {
+		Entries []matchEntry `json:"entries"`
+	} `json:"match"`
+	Actions []seqAction `json:"actions"`
+}
+
+// generateSeqRule returns the approute sequence that sends the traffic from
+// (direction "source") or to (direction "destination") the endpoints of a
+// dataprefix list over the tunnel.
+func generateSeqRule(id int, direction, dataPrefixList, port, proto, tunnel string) (string, error) {
+	r := seqRule{
+		SequenceID:     id,
+		SequenceName:   "App Route",
+		SequenceType:   "appRoute",
+		SequenceIPType: "ipv4",
+	}
+	r.Match.Entries = []matchEntry{
+		{Field: direction + "DataPrefixList", Ref: dataPrefixList},
+		{Field: direction + "Port", Value: port},
+		{Field: "protocol", Value: proto},
+	}
+	r.Actions = []seqAction{{Type: "backupSlaPreferredColor", Parameter: tunnel}}
+	b, err := json.Marshal(r)
+	return string(b), err
+}
+
+type ipPrefix struct {
+	IPPrefix string `json:"ipPrefix"`
+}
+
+type prefixList struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Type        string     `json:"type"`
+	Entries     []ipPrefix `json:"entries"`
+}
+
+// generateDataPrefixList returns the dataprefix list of the endpoints, which
+// must be IPv4 addresses: the approute sequences match IPv4 only.
+func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) (string, error) {
+	l := prefixList{
+		Name:        name,
+		Description: defaultDescription,
+		Type:        "dataPrefix",
+		Entries:     make([]ipPrefix, 0, len(endpoints)),
+	}
+	for _, val := range endpoints {
+		addr, err := netip.ParseAddr(val)
+		if err != nil || !addr.Is4() {
+			return "", fmt.Errorf("%w: endpoint %q is not an IPv4 address", ErrInvalidSpec, val)
+		}
+		l.Entries = append(l.Entries, ipPrefix{IPPrefix: addr.String() + "/32"})
+	}
+	b, err := json.Marshal(l)
+	return string(b), err
 }
 
 func (m *sdwanManager) deactivateCentralPolicy() error {

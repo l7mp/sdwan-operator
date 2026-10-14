@@ -47,6 +47,8 @@ type fakeVManage struct {
 	// are truncated to maxListNameLen, as vManage does.
 	dataPrefixLists map[string]string
 	nextList        int
+	// approute is the approute definition, as last PUT.
+	approute string
 	// calls lists "METHOD path" of the API calls made with a valid session.
 	calls []string
 }
@@ -59,6 +61,7 @@ func newFakeVManage(t *testing.T) (*fakeVManage, *httptest.Server) {
 		sessions:        map[string]bool{},
 		vsmartPolicies:  `[{"policyName":"` + CentralizedPolicyName + `","policyId":"cp-1"}]`,
 		dataPrefixLists: map[string]string{},
+		approute:        `{"definitionId":"ar-1","name":"SDWANOperatorApproutePolicy","type":"appRoute","sequences":[],"defaultAction":{"type":"slaClass"}}`,
 	}
 	ts := httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(ts.Close)
@@ -104,6 +107,10 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	f.calls = append(f.calls, r.Method+" "+path)
 	if f.fail != "" && strings.HasPrefix(r.Method+" "+path, f.fail) {
 		http.Error(w, "failing "+f.fail, http.StatusInternalServerError)
+		return
+	}
+	if (r.Method == http.MethodPost || r.Method == http.MethodPut) && len(body) > 0 && !json.Valid(body) {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -172,9 +179,10 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{}`)
 	case strings.HasPrefix(path, "/template/policy/definition/approute/"):
 		if r.Method == http.MethodGet {
-			_, _ = fmt.Fprint(w, `{"definitionId":"ar-1","name":"SDWANOperatorApproutePolicy","sequences":[]}`)
+			_, _ = fmt.Fprint(w, f.approute)
 			return
 		}
+		f.approute = string(body)
 		_, _ = fmt.Fprint(w, `{}`)
 	default:
 		http.Error(w, "unexpected "+r.Method+" "+path, http.StatusNotFound)
@@ -206,6 +214,12 @@ func (f *fakeVManage) lists() map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return maps.Clone(f.dataPrefixLists)
+}
+
+func (f *fakeVManage) approuteDefinition() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.approute
 }
 
 func (f *fakeVManage) state() (logins int, calls []string) {
@@ -591,6 +605,67 @@ func TestFailedDeactivateIsLoggedAsError(t *testing.T) {
 	defer mu.Unlock()
 	if !slices.ContainsFunc(errorLogs, func(l string) bool { return strings.Contains(l, "cannot deactivate central policy") }) {
 		t.Fatalf("failed deactivate not logged as an error; error logs: %q", errorLogs)
+	}
+}
+
+// The approute sequences were built by string concatenation: they ended in a
+// stray "]}", and a tunnel annotation with a quote could inject fields.
+func TestUpsertSendsValidApproute(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+
+	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet mpls"); err != nil {
+		t.Fatal(err)
+	}
+	def := f.approuteDefinition()
+	if !gjson.Valid(def) {
+		t.Fatalf("approute definition is not valid JSON: %s", def)
+	}
+	if got := gjson.Get(def, "defaultAction.type").String(); got != "slaClass" {
+		t.Fatalf("approute definition lost its defaultAction: %s", def)
+	}
+	seqs := gjson.Get(def, "sequences").Array()
+	if len(seqs) != 2 {
+		t.Fatalf("expected 2 sequences, got %s", def)
+	}
+	for i, direction := range []string{"source", "destination"} {
+		seq := seqs[i]
+		if got := seq.Get("actions.0.parameter").String(); got != "biz-internet mpls" {
+			t.Fatalf("sequence %d tunnel = %q", i, got)
+		}
+		if got := seq.Get("match.entries.0.field").String(); got != direction+"DataPrefixList" {
+			t.Fatalf("sequence %d matches %q", i, got)
+		}
+		if got := seq.Get(`match.entries.#(field=="protocol").value`).String(); got != "6" {
+			t.Fatalf("sequence %d protocol = %q", i, got)
+		}
+	}
+}
+
+func TestUpsertRejectsInvalidSpec(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, tunnel, address string
+	}{
+		{"tunnel with a quote", `biz-internet"}],"x":"y`, "10.0.0.1"},
+		{"empty tunnel", "", "10.0.0.1"},
+		{"address with a quote", "biz-internet", `10.0.0.1"`},
+		{"IPv6 address", "biz-internet", "fd00::1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+
+			err := m.HandleUpsertEvent("default", "app", []string{tc.address}, 8080, "TCP", tc.tunnel)
+			if !errors.Is(err, ErrInvalidSpec) {
+				t.Fatalf("expected ErrInvalidSpec, got %v", err)
+			}
+			if _, calls := f.state(); len(calls) != 0 {
+				t.Fatalf("vManage called for an invalid spec: %q", calls)
+			}
+		})
 	}
 }
 
