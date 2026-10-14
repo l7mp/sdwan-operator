@@ -132,7 +132,7 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	}
 
 	// det dataprefixlist id
-	dpid, ok := findByPrefix(m.objectCache["dataprefix"], objName)
+	dpid, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
 		return errors.New("fail to get dataprefix id")
 	}
@@ -156,8 +156,7 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
 
 	// delete dataprefix
-	k, _ := findKeyByPrefix(m.objectCache["dataprefix"], objName)
-	delete(m.objectCache["dataprefix"], k)
+	delete(m.objectCache["dataprefix"], objName)
 	endpoint = "/template/policy/list/dataprefix/" + dpid
 	res, err = m.client.Delete(endpoint)
 	if err != nil {
@@ -210,7 +209,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) error {
 	data := m.generateDataPrefixList(objName, endpoints)
 	endpoint := "/template/policy/list/dataprefix/"
-	id, ok := findByPrefix(m.objectCache["dataprefix"], objName)
+	id, ok := m.objectCache["dataprefix"][objName]
 	if ok {
 		putEndpoint := endpoint + id
 		res, err := m.client.Put(putEndpoint, data)
@@ -233,7 +232,7 @@ func (m *sdwanManager) upsertDataPrefixList(objName string, endpoints []string) 
 }
 
 func (m *sdwanManager) updateApproute(objName, port, proto, tunnel string) error {
-	dataPrefixList, ok := findByPrefix(m.objectCache["dataprefix"], objName)
+	dataPrefixList, ok := m.objectCache["dataprefix"][objName]
 	if !ok {
 		return errors.New("fail to get dataprefix")
 	}

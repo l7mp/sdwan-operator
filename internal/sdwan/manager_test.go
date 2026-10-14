@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -39,7 +40,8 @@ type fakeVManage struct {
 	listsBroken bool
 	// vsmartPolicies is the data array of the vSmart policy list.
 	vsmartPolicies string
-	// dataPrefixLists maps the dataprefix lists by name to their id.
+	// dataPrefixLists maps the dataprefix lists by name to their id. Names
+	// are truncated to maxListNameLen, as vManage does.
 	dataPrefixLists map[string]string
 	nextList        int
 	// calls lists "METHOD path" of the API calls made with a valid session.
@@ -138,9 +140,17 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprint(w, `{"id":"vsmart_policy_config-1"}`)
 	case r.Method == http.MethodPost && path == "/template/policy/list/dataprefix/":
+		name := gjson.GetBytes(body, "name").String()
+		if len(name) > maxListNameLen {
+			name = name[:maxListNameLen]
+		}
+		if _, ok := f.dataPrefixLists[name]; ok {
+			http.Error(w, "duplicate list name "+name, http.StatusBadRequest)
+			return
+		}
 		f.nextList++
 		id := fmt.Sprintf("dp-%d", f.nextList)
-		f.dataPrefixLists[gjson.GetBytes(body, "name").String()] = id
+		f.dataPrefixLists[name] = id
 		_, _ = fmt.Fprintf(w, `{"listId":%q}`, id)
 	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && strings.HasPrefix(path, "/template/policy/list/dataprefix/"):
 		id := strings.TrimPrefix(path, "/template/policy/list/dataprefix/")
@@ -183,6 +193,12 @@ func (f *fakeVManage) setDataPrefixList(name, id string) {
 		return
 	}
 	f.dataPrefixLists[name] = id
+}
+
+func (f *fakeVManage) lists() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return maps.Clone(f.dataPrefixLists)
 }
 
 func (f *fakeVManage) state() (logins int, calls []string) {
@@ -385,7 +401,7 @@ func TestRefreshCacheFindsCentralPolicy(t *testing.T) {
 // that no longer existed.
 func TestUpsertSeesListsChangedInVManage(t *testing.T) {
 	t.Parallel()
-	const name = "default___llamacpp-backends"
+	name := convertK8sNameToSdWan("default", "llamacpp-backends")
 	for _, tc := range []struct {
 		name, newID, want string
 	}{
@@ -441,6 +457,46 @@ func TestUpsertFailsBeforeChangesWhenListsCannotBeRead(t *testing.T) {
 	}
 	if !reflect.DeepEqual(m.objectCache, cache) {
 		t.Fatalf("cache changed by a failed refresh: %#v, was %#v", m.objectCache, cache)
+	}
+}
+
+// Lists were looked up by the first 20 characters of their name, so
+// business-app-1 and business-app-10 shared a list: an update or delete of one
+// hit the other.
+func TestListsOfSimilarNamesStayApart(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	upsertApp := func(name, address string) {
+		t.Helper()
+		if err := m.HandleUpsertEvent("default", name, []string{address}, 8080, "TCP", "biz-internet"); err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+	}
+
+	upsertApp("business-app-1", "10.0.0.1")
+	upsertApp("business-app-10", "10.0.0.10")
+	lists := f.lists()
+	if len(lists) != 2 {
+		t.Fatalf("expected a list per service, got %v", lists)
+	}
+	id1 := lists[convertK8sNameToSdWan("default", "business-app-1")]
+	id10 := lists[convertK8sNameToSdWan("default", "business-app-10")]
+	if id1 == "" || id10 == "" || id1 == id10 {
+		t.Fatalf("services do not have their own lists: %v", lists)
+	}
+
+	_, before := f.state()
+	if err := m.HandleDeleteEvent("default", "business-app-10"); err != nil {
+		t.Fatalf("delete business-app-10: %v", err)
+	}
+	_, calls := f.state()
+	if calls = calls[len(before):]; !slices.Contains(calls, "DELETE /template/policy/list/dataprefix/"+id10) ||
+		slices.Contains(calls, "DELETE /template/policy/list/dataprefix/"+id1) {
+		t.Fatalf("delete of business-app-10 hit the wrong list; calls: %q", calls)
+	}
+	if lists := f.lists(); len(lists) != 1 || lists[convertK8sNameToSdWan("default", "business-app-1")] != id1 {
+		t.Fatalf("business-app-1 lost its list: %v", lists)
 	}
 }
 
