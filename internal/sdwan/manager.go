@@ -40,9 +40,12 @@ var ErrInvalidSpec = errors.New("invalid tunnel policy")
 // parameter of the backupSlaPreferredColor action.
 var tunnelRe = regexp.MustCompile(`^[a-z0-9-]+( [a-z0-9-]+)*$`)
 
+// protocolNumbers maps the protocols of a Kubernetes Service to IP protocol
+// numbers.
 var protocolNumbers = map[string]int32{
-	"TCP": 6,
-	"UDP": 17,
+	"TCP":  6,
+	"UDP":  17,
+	"SCTP": 132,
 }
 
 type Manager interface {
@@ -192,6 +195,10 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 	if !tunnelRe.MatchString(tunnel) {
 		return fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
 	}
+	protoNum, ok := protocolNumbers[protocol]
+	if !ok {
+		return fmt.Errorf("%w: unknown protocol %q", ErrInvalidSpec, protocol)
+	}
 	listData, err := m.generateDataPrefixList(objName, endpoints)
 	if err != nil {
 		return err
@@ -206,7 +213,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 	}
 
 	port := strconv.Itoa(int(targetPort))
-	proto := strconv.Itoa(int(protocolNumbers[protocol]))
+	proto := strconv.Itoa(int(protoNum))
 	legacyID := m.legacyListID(namespace, name)
 
 	return m.applyChange("upsert", func() error {

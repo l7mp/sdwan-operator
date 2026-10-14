@@ -677,19 +677,22 @@ func TestUpsertSendsValidApproute(t *testing.T) {
 func TestUpsertRejectsInvalidSpec(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name, tunnel, address string
+		name, protocol, tunnel, address string
 	}{
-		{"tunnel with a quote", `biz-internet"}],"x":"y`, "10.0.0.1"},
-		{"empty tunnel", "", "10.0.0.1"},
-		{"address with a quote", "biz-internet", `10.0.0.1"`},
-		{"IPv6 address", "biz-internet", "fd00::1"},
+		{"tunnel with a quote", "TCP", `biz-internet"}],"x":"y`, "10.0.0.1"},
+		{"empty tunnel", "TCP", "", "10.0.0.1"},
+		{"address with a quote", "TCP", "biz-internet", `10.0.0.1"`},
+		{"IPv6 address", "TCP", "biz-internet", "fd00::1"},
+		// An unknown protocol was sent to vManage as protocol 0.
+		{"unknown protocol", "ICMP", "biz-internet", "10.0.0.1"},
+		{"empty protocol", "", "biz-internet", "10.0.0.1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f, ts := newFakeVManage(t)
 			m := newTestManager(t, ts.URL)
 
-			err := m.HandleUpsertEvent("default", "app", []string{tc.address}, 8080, "TCP", tc.tunnel)
+			err := m.HandleUpsertEvent("default", "app", []string{tc.address}, 8080, tc.protocol, tc.tunnel)
 			if !errors.Is(err, ErrInvalidSpec) {
 				t.Fatalf("expected ErrInvalidSpec, got %v", err)
 			}
@@ -774,6 +777,25 @@ func TestUpsertWithoutEndpointsRemovesList(t *testing.T) {
 		if lists := f.lists(); len(lists) != 0 || f.usesList(id) {
 			t.Fatalf("list not removed: lists %v, approute %s", lists, f.approuteDefinition())
 		}
+	}
+}
+
+func TestUpsertProtocolNumbers(t *testing.T) {
+	t.Parallel()
+	for protocol, want := range map[string]string{"TCP": "6", "UDP": "17", "SCTP": "132"} {
+		t.Run(protocol, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+
+			if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, protocol, "biz-internet"); err != nil {
+				t.Fatal(err)
+			}
+			got := gjson.Get(f.approuteDefinition(), `sequences.#.match.entries.#(field=="protocol").value`).Array()
+			if len(got) != 2 || got[0].String() != want || got[1].String() != want {
+				t.Fatalf("protocol %s sent as %v, want %s", protocol, got, want)
+			}
+		})
 	}
 }
 
