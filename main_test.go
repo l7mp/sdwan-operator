@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -164,5 +166,91 @@ func TestGetTargetPort(t *testing.T) {
 	}
 	if _, err := getTargetPort(map[string]any{}); err == nil {
 		t.Fatal("missing targetPort accepted")
+	}
+}
+
+func blockUntilDone(ctx context.Context) error {
+	<-ctx.Done()
+	return nil
+}
+
+func runAsync(ctx context.Context, r *policyController, timeout time.Duration) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, logr.Discard(), blockUntilDone, blockUntilDone, make(chan error), r.waitChanges, timeout)
+	}()
+	return done
+}
+
+// On shutdown the error reporter called os.Exit(1), which would also end this
+// test binary.
+func TestRunReturnsOnShutdown(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(ctx, &policyController{}, time.Second)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run after shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run does not return after shutdown")
+	}
+}
+
+// A change cut short by shutdown can leave the central policy deactivated, so
+// shutdown waits for the change in progress, and no new change starts.
+func TestRunWaitsForChangeInProgress(t *testing.T) {
+	t.Parallel()
+	r := &policyController{log: logr.Discard(), sdwanManager: &fakeManager{}}
+	r.changing.RLock() // a change in progress
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(ctx, r, time.Minute)
+	cancel()
+
+	select {
+	case err := <-done:
+		t.Fatalf("run returned during a change: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	r.changing.RUnlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run after the change: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run does not return after the change finished")
+	}
+
+	started := make(chan struct{})
+	go func() {
+		_, _ = r.Reconcile(context.Background(), request(object.Deleted))
+		close(started)
+	}()
+	select {
+	case <-started:
+		t.Fatal("a change started after shutdown")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRunGivesUpOnStuckChange(t *testing.T) {
+	t.Parallel()
+	r := &policyController{}
+	r.changing.RLock() // never finishes
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(ctx, r, 50*time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "still in progress") {
+			t.Fatalf("expected a timeout error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run does not give up on a stuck change")
 	}
 }

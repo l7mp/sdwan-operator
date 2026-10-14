@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -47,6 +48,9 @@ const (
 	maxPort                         = 65535
 	retryBaseDelay                  = time.Second
 	retryMaxDelay                   = 5 * time.Minute
+	// changeTimeout bounds the wait for a change at shutdown: a change waits
+	// for the vManage tasks twice, at most 5 minutes each.
+	changeTimeout = 11 * time.Minute
 )
 
 var (
@@ -60,7 +64,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
-func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, error) {
+func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, *policyController, error) {
 	log := logger.WithName("sdwan-op")
 	ctrl.SetLogger(log)
 
@@ -70,16 +74,16 @@ func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, erro
 		CacheOptions: cache.CacheOptions{Logger: logger},
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	apiServerConfig, err := apiserver.NewDefaultConfig("", apiServerPort, api.Client, true, false, logger)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	server, err = apiserver.NewAPIServer(apiServerConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Load the operator from file
@@ -93,7 +97,7 @@ func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, erro
 
 	op, err := doperator.NewFromFile("sdwan-operator", config, specFile, opts)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create SDWAN operator: %w", err)
+		return nil, nil, fmt.Errorf("unable to create SDWAN operator: %w", err)
 	}
 
 	// Read vManage config
@@ -101,19 +105,20 @@ func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, erro
 	if !*dryRun {
 		c, err := sdwan.ReadConfig(*configFile)
 		if err != nil {
-			return nil, fmt.Errorf("unable to read vManage config: %w", err)
+			return nil, nil, fmt.Errorf("unable to read vManage config: %w", err)
 		}
 		vManageConf = c
 	}
 
 	// Create the SD-WAN policy controller
-	if _, err := NewPolicyController(op.GetManager(), logger, *vManageConf); err != nil {
-		return nil, fmt.Errorf("failed to create policy controller: %w", err)
+	pc, err := NewPolicyController(op.GetManager(), logger, *vManageConf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create policy controller: %w", err)
 	}
 
 	log.Info("created SDWAN policy controller")
 
-	return op, nil
+	return op, pc, nil
 }
 
 // policyController implements the policy controller
@@ -121,6 +126,24 @@ type policyController struct {
 	client.Client
 	log          logr.Logger
 	sdwanManager sdwan.Manager
+	// changing is read-locked while an SD-WAN change is in progress.
+	changing sync.RWMutex
+}
+
+// waitChanges waits until no SD-WAN change is in progress, for at most
+// timeout, and keeps new changes from starting. It returns false on timeout.
+func (r *policyController) waitChanges(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		r.changing.Lock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.Config) (*policyController, error) {
@@ -166,6 +189,11 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 
 func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Request) (reconcile.Result, error) {
 	r.log.Info("Reconciling", "request", req.String())
+
+	// A change interrupted between deactivating and activating the central
+	// policy would leave it off: shutdown waits for it.
+	r.changing.RLock()
+	defer r.changing.RUnlock()
 
 	if err := r.reconcileEvent(ctx, req); err != nil {
 		// A policy that cannot be applied as specified is not retried; any
@@ -344,14 +372,24 @@ func main() {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	op, err := NewOperator(specFile, logger)
+	op, pc, err := NewOperator(specFile, logger)
 	if err != nil {
 		log.Error(err, "problem running operator")
 		os.Exit(1)
 	}
 
+	if err := run(ctx, log, op.Start, server.Start, op.GetErrorChannel(), pc.waitChanges, changeTimeout); err != nil {
+		log.Error(err, "problem running operator")
+		os.Exit(1)
+	}
+}
+
+// run runs the operator and its API server until ctx is done. It then waits
+// for the SD-WAN change in progress, if any, for at most timeout.
+func run(ctx context.Context, log logr.Logger, startOp, startServer func(context.Context) error,
+	errs <-chan error, waitChanges func(time.Duration) bool, timeout time.Duration) error {
 	go func() {
-		if err := server.Start(ctx); err != nil {
+		if err := startServer(ctx); err != nil {
 			log.Error(err, "problem running operator")
 		}
 	}()
@@ -361,15 +399,17 @@ func main() {
 		for {
 			select {
 			case <-ctx.Done():
-				os.Exit(1)
-			case err := <-op.GetErrorChannel():
+				return
+			case err := <-errs:
 				log.Error(err, "operator error")
 			}
 		}
 	}()
 
-	if err := op.Start(ctx); err != nil {
-		log.Error(err, "problem running operator")
-		os.Exit(1)
+	err := startOp(ctx)
+	if !waitChanges(timeout) {
+		return errors.Join(err, fmt.Errorf("SD-WAN change still in progress after %s", timeout))
 	}
+
+	return err
 }

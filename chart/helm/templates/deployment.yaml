@@ -46,4 +46,5 @@ spec:
       securityContext:
         runAsNonRoot: true
       serviceAccountName: sdwan-operator
-      terminationGracePeriodSeconds: 60
+      # a change in progress at shutdown is finished, which takes up to 11 minutes
+      terminationGracePeriodSeconds: 720
