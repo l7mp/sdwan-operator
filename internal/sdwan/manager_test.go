@@ -856,6 +856,25 @@ func TestUpsertSkipsIPv6Endpoints(t *testing.T) {
 	}
 }
 
+// The checks moved into sdwanManager, so a dry run accepted specs that a real
+// run rejects.
+func TestDryRunRejectsInvalidSpec(t *testing.T) {
+	t.Parallel()
+	m, err := NewManager(Config{DryRun: true}, logr.Discard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+		t.Fatalf("dry run rejects a valid spec: %v", err)
+	}
+	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "Biz-Internet"); !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("dry run accepts an invalid tunnel: %v", err)
+	}
+	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "ICMP", "biz-internet"); !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("dry run accepts an unknown protocol: %v", err)
+	}
+}
+
 func countCalls(calls []string, want string) int {
 	n := 0
 	for _, c := range calls {

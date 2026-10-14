@@ -81,11 +81,14 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 	return m, nil
 }
 
+// nullManager changes nothing, but rejects what sdwanManager rejects, so that
+// a dry run finds invalid specs.
 type nullManager struct{}
 
 func (m *nullManager) HandleDeleteEvent(_, _ string) error { return nil }
-func (m *nullManager) HandleUpsertEvent(_, _ string, _ []string, _ int64, _, _ string) error {
-	return nil
+func (m *nullManager) HandleUpsertEvent(_, _ string, endpoints []string, _ int64, protocol, tunnel string) error {
+	_, _, err := checkUpsert(endpoints, protocol, tunnel)
+	return err
 }
 
 type sdwanManager struct {
