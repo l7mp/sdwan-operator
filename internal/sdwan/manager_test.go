@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/netascode/go-sdwan"
 	"github.com/tidwall/gjson"
 )
@@ -563,6 +564,33 @@ func TestDeleteOfUnknownListLeavesCentralPolicyAlone(t *testing.T) {
 	}
 	if _, calls := f.state(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/policy/vsmart/") }) {
 		t.Fatalf("central policy toggled for an unknown list; calls: %q", calls)
+	}
+}
+
+// A failed deactivate was logged at info level, so it did not show up among
+// the errors.
+func TestFailedDeactivateIsLoggedAsError(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.fail = "POST /template/policy/vsmart/deactivate/"
+	m := newTestManager(t, ts.URL)
+	var mu sync.Mutex
+	var errorLogs []string
+	m.log = funcr.New(func(_, args string) {
+		if strings.Contains(args, `"error"=`) {
+			mu.Lock()
+			defer mu.Unlock()
+			errorLogs = append(errorLogs, args)
+		}
+	}, funcr.Options{})
+
+	if err := upsert(m); err != nil {
+		t.Fatalf("upsert must go ahead after a failed deactivate: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.ContainsFunc(errorLogs, func(l string) bool { return strings.Contains(l, "cannot deactivate central policy") }) {
+		t.Fatalf("failed deactivate not logged as an error; error logs: %q", errorLogs)
 	}
 }
 

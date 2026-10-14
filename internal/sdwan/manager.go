@@ -195,7 +195,7 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 // cannot leave the network-wide policy off.
 func (m *sdwanManager) applyChange(op string, change func() error) error {
 	if err := m.deactivateCentralPolicy(); err != nil {
-		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue %s. err: %s", op, err))
+		m.log.Error(err, "cannot deactivate central policy, continuing", "op", op)
 	}
 
 	err := change()
