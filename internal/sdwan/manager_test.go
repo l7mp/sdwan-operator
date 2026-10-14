@@ -690,7 +690,6 @@ func TestUpsertRejectsInvalidSpec(t *testing.T) {
 		{"tunnel with a quote", "TCP", `biz-internet"}],"x":"y`, "10.0.0.1"},
 		{"empty tunnel", "TCP", "", "10.0.0.1"},
 		{"address with a quote", "TCP", "biz-internet", `10.0.0.1"`},
-		{"IPv6 address", "TCP", "biz-internet", "fd00::1"},
 		// An unknown protocol was sent to vManage as protocol 0.
 		{"unknown protocol", "ICMP", "biz-internet", "10.0.0.1"},
 		{"empty protocol", "", "biz-internet", "10.0.0.1"},
@@ -830,6 +829,30 @@ func TestUpsertChecksResponses(t *testing.T) {
 				t.Fatalf("approute definition changed: %s", got)
 			}
 		})
+	}
+}
+
+// A single IPv6 endpoint of a dual-stack service failed the whole upsert, so
+// the service lost its SD-WAN policy.
+func TestUpsertSkipsIPv6Endpoints(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+
+	if err := m.HandleUpsertEvent("default", "app", []string{"fd00::1", "10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+		t.Fatal(err)
+	}
+	id := f.lists()["default___app"]
+	if id == "" || !f.usesList(id) {
+		t.Fatalf("no list for the IPv4 endpoint: %v", f.lists())
+	}
+
+	// with only IPv6 endpoints left there is nothing to route
+	if err := m.HandleUpsertEvent("default", "app", []string{"fd00::1"}, 8080, "TCP", "biz-internet"); err != nil {
+		t.Fatal(err)
+	}
+	if lists := f.lists(); len(lists) != 0 || f.usesList(id) {
+		t.Fatalf("list not removed without IPv4 endpoints: %v", lists)
 	}
 }
 

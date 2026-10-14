@@ -186,20 +186,20 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
+	ipv4, protoNum, err := checkUpsert(endpoints, protocol, tunnel)
+	if err != nil {
+		return err
+	}
+	if len(ipv4) < len(endpoints) {
+		m.log.Info("skipping IPv6 endpoints: approute sequences match IPv4 only", "name", objName)
+	}
 	// Without endpoints there is nothing to route: remove the service's list
 	// rather than sending vManage an empty one.
-	if len(endpoints) == 0 {
+	if len(ipv4) == 0 {
 		return m.HandleDeleteEvent(namespace, name)
 	}
 
-	if !tunnelRe.MatchString(tunnel) {
-		return fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
-	}
-	protoNum, ok := protocolNumbers[protocol]
-	if !ok {
-		return fmt.Errorf("%w: unknown protocol %q", ErrInvalidSpec, protocol)
-	}
-	listData, err := m.generateDataPrefixList(objName, endpoints)
+	listData, err := m.generateDataPrefixList(objName, ipv4)
 	if err != nil {
 		return err
 	}
@@ -435,8 +435,38 @@ type prefixList struct {
 	Entries     []ipPrefix `json:"entries"`
 }
 
-// generateDataPrefixList returns the dataprefix list of the endpoints, which
-// must be IPv4 addresses: the approute sequences match IPv4 only.
+// checkUpsert checks the fields of an upsert. It returns the IPv4 endpoints
+// and the IP protocol number.
+// The approute sequences match IPv4 only, so the IPv6 endpoints of a
+// dual-stack service are left out. Without IPv4 endpoints the upsert removes
+// the service's list, so the other fields are not checked then.
+func checkUpsert(endpoints []string, protocol, tunnel string) ([]string, int32, error) {
+	ipv4 := make([]string, 0, len(endpoints))
+	for _, val := range endpoints {
+		addr, err := netip.ParseAddr(val)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%w: endpoint %q is not an IP address", ErrInvalidSpec, val)
+		}
+		if addr.Is4() {
+			ipv4 = append(ipv4, addr.String())
+		}
+	}
+	if len(ipv4) == 0 {
+		return ipv4, 0, nil
+	}
+
+	if !tunnelRe.MatchString(tunnel) {
+		return nil, 0, fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
+	}
+	protoNum, ok := protocolNumbers[protocol]
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: unknown protocol %q", ErrInvalidSpec, protocol)
+	}
+
+	return ipv4, protoNum, nil
+}
+
+// generateDataPrefixList returns the dataprefix list of IPv4 endpoints.
 func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) (string, error) {
 	l := prefixList{
 		Name:        name,
@@ -445,11 +475,7 @@ func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) (
 		Entries:     make([]ipPrefix, 0, len(endpoints)),
 	}
 	for _, val := range endpoints {
-		addr, err := netip.ParseAddr(val)
-		if err != nil || !addr.Is4() {
-			return "", fmt.Errorf("%w: endpoint %q is not an IPv4 address", ErrInvalidSpec, val)
-		}
-		l.Entries = append(l.Entries, ipPrefix{IPPrefix: addr.String() + "/32"})
+		l.Entries = append(l.Entries, ipPrefix{IPPrefix: val + "/32"})
 	}
 	b, err := json.Marshal(l)
 	return string(b), err
