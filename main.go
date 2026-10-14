@@ -48,6 +48,8 @@ const (
 	maxPort                         = 65535
 	retryBaseDelay                  = time.Second
 	retryMaxDelay                   = 5 * time.Minute
+	// maxAttempts is the number of attempts of an event before giving up.
+	maxAttempts = 10
 	// changeTimeout bounds the wait for a change at shutdown: a change waits
 	// for the vManage tasks twice, at most 5 minutes each.
 	changeTimeout = 11 * time.Minute
@@ -128,6 +130,9 @@ type policyController struct {
 	sdwanManager sdwan.Manager
 	// changing is read-locked while an SD-WAN change is in progress.
 	changing sync.RWMutex
+	// failures counts the failed attempts of each event.
+	failuresMu sync.Mutex
+	failures   map[string]int
 }
 
 // waitChanges waits until no SD-WAN change is in progress, for at most
@@ -195,7 +200,12 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 	r.changing.RLock()
 	defer r.changing.RUnlock()
 
-	if err := r.reconcileEvent(ctx, req); err != nil {
+	err := r.reconcileEvent(ctx, req)
+	if n := r.countFailure(req, err); n >= maxAttempts {
+		// Every attempt toggles the central policy: give up eventually.
+		err = reconcile.TerminalError(fmt.Errorf("giving up after %d attempts: %w", n, err))
+	}
+	if err != nil {
 		// A policy that cannot be applied as specified is not retried; any
 		// other error is, with backoff.
 		if errors.Is(err, sdwan.ErrInvalidSpec) {
@@ -207,6 +217,27 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 	r.log.Info("Reconciliation done")
 
 	return reconcile.Result{}, nil
+}
+
+// countFailure returns the number of failed attempts of the event so far,
+// counting err. It forgets the event when it succeeds or fails for good.
+func (r *policyController) countFailure(req dreconciler.Request, err error) int {
+	key := fmt.Sprintf("%s/%s/%s", req.Namespace, req.Name, req.EventType)
+	r.failuresMu.Lock()
+	defer r.failuresMu.Unlock()
+	if err == nil || errors.Is(err, sdwan.ErrInvalidSpec) {
+		delete(r.failures, key)
+		return 0
+	}
+	if r.failures == nil {
+		r.failures = make(map[string]int)
+	}
+	r.failures[key]++
+	n := r.failures[key]
+	if n >= maxAttempts {
+		delete(r.failures, key)
+	}
+	return n
 }
 
 func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.Request) error {

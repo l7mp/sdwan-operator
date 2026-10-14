@@ -353,3 +353,30 @@ func TestRetriedDeleteSparesRecreatedObject(t *testing.T) {
 		t.Fatalf("delete of a recreated object removed its SD-WAN resources")
 	}
 }
+
+// A change that keeps failing was retried forever, and every attempt
+// deactivated and activated the central policy.
+func TestReconcileGivesUpEventually(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{err: errors.New("vManage refuses")}
+	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(validSpec())}, log: logr.Discard(), sdwanManager: m}
+
+	for i := 1; i <= maxAttempts; i++ {
+		_, err := r.Reconcile(context.Background(), request(object.Added))
+		if terminal := errors.Is(err, reconcile.TerminalError(nil)); err == nil || terminal != (i == maxAttempts) {
+			t.Fatalf("attempt %d: got %v", i, err)
+		}
+	}
+
+	// the count starts over, and a success resets it
+	m.err = nil
+	if _, err := r.Reconcile(context.Background(), request(object.Added)); err != nil {
+		t.Fatal(err)
+	}
+	m.err = errors.New("vManage refuses")
+	for i := 1; i < maxAttempts; i++ {
+		if _, err := r.Reconcile(context.Background(), request(object.Added)); errors.Is(err, reconcile.TerminalError(nil)) {
+			t.Fatalf("attempt %d after a success is terminal: %v", i, err)
+		}
+	}
+}
