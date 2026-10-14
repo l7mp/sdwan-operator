@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -169,10 +170,7 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprint(w, `{"id":"vsmart_policy_config-1"}`)
 	case r.Method == http.MethodPost && path == "/template/policy/list/dataprefix/":
-		name := gjson.GetBytes(body, "name").String()
-		if len(name) > maxListNameLen {
-			name = name[:maxListNameLen]
-		}
+		name := vManageStoredName(gjson.GetBytes(body, "name").String())
 		if _, ok := f.dataPrefixLists[name]; ok {
 			http.Error(w, "duplicate list name "+name, http.StatusBadRequest)
 			return
@@ -206,6 +204,20 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unexpected "+r.Method+" "+path, http.StatusNotFound)
 	}
+}
+
+// vManageStoredName returns the name vManage 20.15 stores for a list: names
+// longer than vManageMaxNameLen become a prefix, "-" and the Java hashCode.
+func vManageStoredName(name string) string {
+	if len(name) <= vManageMaxNameLen {
+		return name
+	}
+	h := int64(javaStringHash(name))
+	if h < 0 {
+		h = -h
+	}
+	suffix := "-" + strconv.FormatInt(h, 10)
+	return name[:vManageMaxNameLen-len(suffix)] + suffix
 }
 
 func (f *fakeVManage) dataPrefixListName(id string) (string, bool) {
@@ -716,18 +728,21 @@ func TestUpsertRejectsInvalidSpec(t *testing.T) {
 	}
 }
 
-// Before names were hashed, vManage kept long list names truncated to 20
-// characters. Those lists and their approute sequences must be removed once
-// the service has a list under its new name, or when the service is deleted.
+// Before names were hashed, the operator sent the full name, which vManage
+// kept if it had at most 32 characters and otherwise shortened (see
+// vManageStoredName). Those lists and their approute sequences must be removed
+// once the service has a list under its new name, or when it is deleted.
 func TestLegacyListsAreRemoved(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name, service, legacy string
 		delete                bool
 	}{
-		{"upsert, long name", "llamacpp-backends", "default___llamacpp-b", false},
+		// the list vManage 20.15 holds for the testbed's llamacpp-backends
+		{"upsert, name over 32 characters", "llamacpp-backends-TCP-50052", "default___llamacpp-ba-1140021977", false},
+		{"upsert, name of 20 to 32 characters", "llamacpp-backends", "default___llamacpp-backends", false},
 		{"upsert, name of exactly 20 characters", "business-a", "default___business-a", false},
-		{"delete, long name", "llamacpp-backends", "default___llamacpp-b", true},
+		{"delete, name over 32 characters", "llamacpp-backends-TCP-50052", "default___llamacpp-ba-1140021977", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -753,6 +768,28 @@ func TestLegacyListsAreRemoved(t *testing.T) {
 				t.Fatalf("service list wrong after the change: lists %v, approute %s", lists, f.approuteDefinition())
 			}
 		})
+	}
+}
+
+// Services whose long names share their first 21 characters had different
+// lists in vManage (the hash differs): an upsert must remove only its own.
+func TestLegacyListOfAnotherServiceIsKept(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	other := vManageStoredName("default___llamacpp-backends-TCP-50053")
+	f.addLegacyList(t, other, "dp-other")
+	f.addLegacyList(t, "default___llamacpp-ba-1140021977", "dp-legacy")
+	m := newTestManager(t, ts.URL)
+
+	if err := m.HandleUpsertEvent("default", "llamacpp-backends-TCP-50052", []string{"10.0.0.1"}, 50052, "TCP", "biz-internet"); err != nil {
+		t.Fatal(err)
+	}
+	lists := f.lists()
+	if _, ok := lists["default___llamacpp-ba-1140021977"]; ok || f.usesList("dp-legacy") {
+		t.Fatalf("own legacy list not removed: lists %v", lists)
+	}
+	if _, ok := lists[other]; !ok || !f.usesList("dp-other") {
+		t.Fatalf("another service's legacy list %q was touched: lists %v", other, lists)
 	}
 }
 
@@ -900,7 +937,7 @@ func TestUpsertThatCannotSucceedLeavesCentralPolicyAlone(t *testing.T) {
 func TestUpsertKeepsLegacyListVManageRefusesToDelete(t *testing.T) {
 	t.Parallel()
 	f, ts := newFakeVManage(t)
-	f.addLegacyList(t, "default___llamacpp-b", "dp-legacy")
+	f.addLegacyList(t, "default___llamacpp-backends", "dp-legacy")
 	f.fail = "DELETE /template/policy/list/dataprefix/dp-legacy"
 	m := newTestManager(t, ts.URL)
 

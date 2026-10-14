@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -253,11 +254,12 @@ func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []str
 // legacyListID returns the id of the list a Kubernetes object has in vManage
 // from before names were hashed, or "" if it has none.
 func (m *sdwanManager) legacyListID(namespace, name string) string {
-	legacy, ok := legacyListName(namespace, name)
-	if !ok {
-		return ""
+	for _, stored := range slices.Sorted(maps.Keys(m.objectCache["dataprefix"])) {
+		if isLegacyListName(stored, namespace, name) {
+			return m.objectCache["dataprefix"][stored]
+		}
 	}
-	return m.objectCache["dataprefix"][legacy]
+	return ""
 }
 
 func (m *sdwanManager) deleteDataPrefixList(id string) error {
