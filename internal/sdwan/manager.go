@@ -46,7 +46,7 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 	}
 
 	// connect to vManage
-	sc, err := sdwan.NewClient(c.URL, c.User, c.Password, c.Insecure)
+	sc, err := sdwan.NewClient(c.URL, c.Insecure, sdwan.WithLogin(c.User, c.Password))
 	if err != nil {
 		return nil, err
 	}

@@ -129,7 +129,7 @@ func newTestManager(t *testing.T, url string) *sdwanManager {
 	t.Helper()
 	// No retries: the fake never fails transiently, and go-sdwan's backoff
 	// would add seconds per failed request.
-	c, err := sdwan.NewClient(url, "admin", "secret", true, sdwan.MaxRetries(0))
+	c, err := sdwan.NewClient(url, true, sdwan.WithLogin("admin", "secret"), sdwan.MaxRetries(0))
 	if err != nil {
 		t.Fatal(err)
 	}
