@@ -1,5 +1,8 @@
 ###########
-FROM docker.io/golang:1.27-alpine AS builder
+# The builder runs on the build platform and cross-compiles for the target: Go needs no
+# emulation for that, an emulated compiler is an order of magnitude slower.
+FROM --platform=$BUILDPLATFORM docker.io/golang:1.27-alpine AS builder
+ARG TARGETOS TARGETARCH
 
 WORKDIR /build
 
@@ -11,7 +14,7 @@ COPY main.go main.go
 COPY internal/ internal/
 #COPY artifacts/ artifacts/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -o sdwan-operator .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -trimpath -o sdwan-operator .
 
 
 ###########
