@@ -18,7 +18,17 @@ const (
 	CentralizedPolicyName = "SDWANOperatorCentralizedPolicy"
 	ApproutePolicyName    = "SDWANOperatorApproutePolicy"
 	defaultDescription    = "managed by SD-WAN operator"
+
+	tasksEndpoint           = "/device/action/status/tasks"
+	defaultTaskWaitTimeout  = 5 * time.Minute
+	defaultTaskPollInterval = 100 * time.Millisecond
 )
+
+// errInvalidResponse is returned when vManage answers with something other
+// than the expected JSON. After vManage ends a session (e.g. idle timeout),
+// every request gets HTTP 200 with the HTML login page, which go-sdwan
+// reports as success with an empty body.
+var errInvalidResponse = errors.New("unexpected vManage response (session expired?)")
 
 var protocolNumbers = map[string]int32{
 	"TCP": 6,
@@ -42,9 +52,11 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 	}
 
 	m := &sdwanManager{
-		client:      sc,
-		objectCache: make(map[string]map[string]string),
-		log:         log,
+		client:           sc,
+		objectCache:      make(map[string]map[string]string),
+		log:              log,
+		taskWaitTimeout:  defaultTaskWaitTimeout,
+		taskPollInterval: defaultTaskPollInterval,
 	}
 
 	//populate SDWAN cache
@@ -67,6 +79,9 @@ type sdwanManager struct {
 	client      sdwan.Client
 	objectCache map[string]map[string]string
 	log         logr.Logger
+	// taskWaitTimeout bounds waitTasksFinish; taskPollInterval is its poll period.
+	taskWaitTimeout  time.Duration
+	taskPollInterval time.Duration
 }
 
 func (m *sdwanManager) initCache() error {
@@ -118,6 +133,10 @@ func (m *sdwanManager) initCache() error {
 func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
 
+	if err := m.ensureSession(); err != nil {
+		return err
+	}
+
 	if err := m.deactivateCentralPolicy(); err != nil {
 		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue delete. err: %s", err))
 	}
@@ -165,6 +184,10 @@ func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
 
 func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
 	objName := convertK8sNameToSdWan(namespace, name)
+
+	if err := m.ensureSession(); err != nil {
+		return err
+	}
 
 	if err := m.deactivateCentralPolicy(); err != nil {
 		m.log.Info(fmt.Sprintf("cannot deactivate central policy, continue upsert. err: %s", err))
@@ -295,15 +318,17 @@ func (m *sdwanManager) generateDataPrefixList(name string, endpoints []string) s
 }
 
 func (m *sdwanManager) deactivateCentralPolicy() error {
-	ret := m.toggleCentralPolicy(false)
-	m.waitTasksFinish()
-	return ret
+	if err := m.toggleCentralPolicy(false); err != nil {
+		return err
+	}
+	return m.waitTasksFinish()
 }
 
 func (m *sdwanManager) activateCentralPolicy() error {
-	ret := m.toggleCentralPolicy(true)
-	m.waitTasksFinish()
-	return ret
+	if err := m.toggleCentralPolicy(true); err != nil {
+		return err
+	}
+	return m.waitTasksFinish()
 }
 
 func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
@@ -327,20 +352,67 @@ func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
 		return err
 	}
 	m.log.Info(fmt.Sprintf("POST %s: %s, result: %s", endpoint, data, res))
+	// vManage starts a task and returns its id; anything else did not apply.
+	if !res.Get("id").Exists() {
+		return fmt.Errorf("POST %s: %w", endpoint, errInvalidResponse)
+	}
 
 	return nil
 }
 
-func (m *sdwanManager) waitTasksFinish() {
-	endpoint := "/device/action/status/tasks"
+// runningTasks returns the vManage tasks that are still running. A response
+// without a runningTasks list (e.g. the login page of an expired session) is
+// errInvalidResponse.
+func (m *sdwanManager) runningTasks() ([]gjson.Result, error) {
+	res, err := m.client.Get(tasksEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	tasks := res.Get("runningTasks")
+	if !tasks.IsArray() {
+		return nil, fmt.Errorf("GET %s: %w", tasksEndpoint, errInvalidResponse)
+	}
+	return tasks.Array(), nil
+}
+
+// ensureSession checks the vManage session before a change. go-sdwan logs in
+// only while it has no token, so after vManage ends the session the token is
+// cleared to force a new login on the next request.
+func (m *sdwanManager) ensureSession() error {
+	_, err := m.runningTasks()
+	if err == nil {
+		return nil
+	}
+	m.log.Info(fmt.Sprintf("vManage session check failed, logging in again: %s", err))
+	m.client.Token = ""
+	if _, err := m.runningTasks(); err != nil {
+		return fmt.Errorf("vManage session: %w", err)
+	}
+	return nil
+}
+
+// waitTasksFinish waits until vManage has no running tasks, for at most
+// taskWaitTimeout. An invalid response clears the token so that the next poll
+// logs in again.
+func (m *sdwanManager) waitTasksFinish() error {
+	deadline := time.Now().Add(m.taskWaitTimeout)
 	for {
-		ret, err := m.client.Get(endpoint)
+		tasks, err := m.runningTasks()
+		if err == nil && len(tasks) == 0 {
+			return nil
+		}
 		if err != nil {
-			m.log.Error(err, fmt.Sprintf("GET %s", endpoint))
+			m.log.Error(err, fmt.Sprintf("GET %s", tasksEndpoint))
+			if errors.Is(err, errInvalidResponse) {
+				m.client.Token = ""
+			}
 		}
-		if ret.Get("runningTasks").String() == "[]" {
-			return
+		if time.Now().After(deadline) {
+			if err == nil {
+				err = fmt.Errorf("%d task(s) still running", len(tasks))
+			}
+			return fmt.Errorf("vManage tasks did not finish within %s: %w", m.taskWaitTimeout, err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(m.taskPollInterval)
 	}
 }
