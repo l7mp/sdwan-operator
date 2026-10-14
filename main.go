@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 
@@ -39,6 +40,7 @@ const (
 	SDWANPolicyTunnelAnnotationName = "policy.sdwan.cisco.com/tunnel"
 	SDWANConfigFile                 = "vmanage-config.yaml"
 	apiServerPort                   = 8443
+	maxPort                         = 65535
 )
 
 var (
@@ -239,34 +241,42 @@ func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Reques
 	return reconcile.Result{}, nil
 }
 
+// getTargetPort returns the target port of a spec. A Service gives it as a
+// number or a string, and a number may be decoded as an integer or a float.
+// Named ports are not supported.
 func getTargetPort(spec map[string]interface{}) (int64, error) {
-	if port, ok, err := unstructured.NestedInt64(spec, "targetPort"); err != nil {
-		return 0, err
-	} else if ok {
-		return port, nil
-	}
-
 	raw, ok := spec["targetPort"]
 	if !ok {
 		return 0, fmt.Errorf("field missing")
 	}
 
+	var port int64
 	switch v := raw.(type) {
+	case int64:
+		port = v
 	case int:
-		return int64(v), nil
+		port = int64(v)
 	case int32:
-		return int64(v), nil
+		port = int64(v)
 	case float64:
-		return int64(v), nil
-	case string:
-		port, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return 0, err
+		if v != math.Trunc(v) || v < 1 || v > maxPort {
+			return 0, fmt.Errorf("invalid port %v", v)
 		}
-		return port, nil
+		port = int64(v)
+	case string:
+		p, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("named port %q is not supported, use a port number", v)
+		}
+		port = p
 	default:
 		return 0, fmt.Errorf("unexpected type %T", raw)
 	}
+	if port < 1 || port > maxPort {
+		return 0, fmt.Errorf("invalid port %d", port)
+	}
+
+	return port, nil
 }
 
 func main() {
