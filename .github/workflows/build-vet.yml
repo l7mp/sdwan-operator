@@ -1,4 +1,4 @@
-name: Build and go vet
+name: Build, go vet and test
 
 on:
   workflow_dispatch:
@@ -34,3 +34,6 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
