@@ -384,14 +384,23 @@ func main() {
 	}
 }
 
-// run runs the operator and its API server until ctx is done. It then waits
-// for the SD-WAN change in progress, if any, for at most timeout.
+// run runs the operator and its API server until ctx is done or the API
+// server fails. It then waits for the SD-WAN change in progress, if any, for at
+// most timeout.
 func run(ctx context.Context, log logr.Logger, startOp, startServer func(context.Context) error,
 	errs <-chan error, waitChanges func(time.Duration) bool, timeout time.Duration) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
 	go func() {
-		if err := startServer(ctx); err != nil {
-			log.Error(err, "problem running operator")
+		err := startServer(ctx)
+		if ctx.Err() != nil {
+			return // shutting down
 		}
+		if err == nil {
+			err = errors.New("stopped")
+		}
+		cancel(fmt.Errorf("API server: %w", err))
 	}()
 
 	// Create an error reporter thread
@@ -407,8 +416,11 @@ func run(ctx context.Context, log logr.Logger, startOp, startServer func(context
 	}()
 
 	err := startOp(ctx)
+	if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) {
+		err = errors.Join(err, cause)
+	}
 	if !waitChanges(timeout) {
-		return errors.Join(err, fmt.Errorf("SD-WAN change still in progress after %s", timeout))
+		err = errors.Join(err, fmt.Errorf("SD-WAN change still in progress after %s", timeout))
 	}
 
 	return err

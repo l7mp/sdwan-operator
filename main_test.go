@@ -254,3 +254,48 @@ func TestRunGivesUpOnStuckChange(t *testing.T) {
 		t.Fatal("run does not give up on a stuck change")
 	}
 }
+
+// A failed API server was only logged: the operator kept running without it.
+func TestRunStopsWhenAPIServerFails(t *testing.T) {
+	t.Parallel()
+	r := &policyController{}
+	failServer := func(context.Context) error { return errors.New("address in use") }
+	done := make(chan error, 1)
+	go func() {
+		done <- run(context.Background(), logr.Discard(), blockUntilDone, failServer, make(chan error), r.waitChanges, time.Second)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "API server: address in use") {
+			t.Fatalf("expected the API server error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator keeps running after the API server failed")
+	}
+}
+
+// An API server that stops because of the shutdown is no error.
+func TestRunIgnoresAPIServerStopOnShutdown(t *testing.T) {
+	t.Parallel()
+	r := &policyController{}
+	stopServer := func(ctx context.Context) error {
+		<-ctx.Done()
+		return errors.New("server closed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, logr.Discard(), blockUntilDone, stopServer, make(chan error), r.waitChanges, time.Second)
+	}()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run after shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run does not return after shutdown")
+	}
+}
