@@ -234,11 +234,6 @@ func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.R
 		r.log.Info("Add/update SD-WAN tunnel policy", "name", name, "namespace", namespace,
 			"spec", fmt.Sprintf("%#v", spec))
 
-		// Must use endoint-pooling when using a real manager
-		if *dryRun || *disableEndpointPooling {
-			return nil
-		}
-
 		port, protocol, tunnel, endpoints, err := parseSpec(spec)
 		if err != nil {
 			return fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
@@ -250,11 +245,6 @@ func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.R
 
 	case object.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
-
-		// Must use endoint-pooling when using a real manager
-		if *dryRun || *disableEndpointPooling {
-			return nil
-		}
 
 		if err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name); err != nil {
 			return fmt.Errorf("failed to delete SD-WAN resources: %w", err)
@@ -282,6 +272,11 @@ func parseSpec(spec map[string]interface{}) (port int64, protocol, tunnel string
 	tunnel, ok, err = unstructured.NestedString(spec, "tunnel")
 	if err != nil || !ok {
 		return 0, "", "", nil, fmt.Errorf("unable to parse tunnel from spec: %v", err)
+	}
+
+	// without endpoint pooling, a spec has a single address
+	if address, ok, err := unstructured.NestedString(spec, "address"); err == nil && ok {
+		return port, protocol, tunnel, []string{address}, nil
 	}
 
 	addresses, ok, err := unstructured.NestedSlice(spec, "addresses")
@@ -341,7 +336,7 @@ func getTargetPort(spec map[string]interface{}) (int64, error) {
 
 func main() {
 	disableEndpointPooling = flag.Bool("disable-endpoint-pooling", false,
-		"Generate per-endpoint objects instead of a single object listing all service endpoints.")
+		"Generate per-endpoint objects instead of a single object listing all service endpoints (requires -dry-run).")
 	dryRun = flag.Bool("dry-run", false, "Suppress SD-WAN policy updates.")
 
 	configFile = flag.String("config-file", SDWANConfigFile, "Config file path")
@@ -360,6 +355,10 @@ func main() {
 	slogHandler := logr.ToSlogHandler(log)
 	slog.SetDefault(slog.New(slogHandler))
 
+	if err := checkFlags(*dryRun, *disableEndpointPooling); err != nil {
+		log.Error(err, "invalid flags")
+		os.Exit(1)
+	}
 	if *dryRun {
 		log.Info("dry-run mode enabled")
 	}
@@ -382,6 +381,15 @@ func main() {
 		log.Error(err, "problem running operator")
 		os.Exit(1)
 	}
+}
+
+// checkFlags rejects flag combinations the operator cannot run with.
+func checkFlags(dryRun, disableEndpointPooling bool) error {
+	// The SD-WAN manager keeps one list of all endpoints per service.
+	if disableEndpointPooling && !dryRun {
+		return errors.New("-disable-endpoint-pooling requires -dry-run: SD-WAN policies need endpoint pooling")
+	}
+	return nil
 }
 
 // run runs the operator and its API server until ctx is done or the API

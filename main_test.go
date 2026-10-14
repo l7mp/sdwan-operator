@@ -299,3 +299,37 @@ func TestRunIgnoresAPIServerStopOnShutdown(t *testing.T) {
 		t.Fatal("run does not return after shutdown")
 	}
 }
+
+// With -disable-endpoint-pooling, Reconcile returned before it did anything,
+// so the flag silently disabled the operator.
+func TestCheckFlags(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ dryRun, noPooling, ok bool }{
+		{false, false, true},
+		{true, false, true},
+		{true, true, true},
+		{false, true, false},
+	} {
+		if err := checkFlags(tc.dryRun, tc.noPooling); (err == nil) != tc.ok {
+			t.Fatalf("checkFlags(dryRun=%v, disableEndpointPooling=%v) = %v", tc.dryRun, tc.noPooling, err)
+		}
+	}
+}
+
+// Without endpoint pooling the pipeline emits a single address, which the
+// reconciler did not read.
+func TestReconcileReadsSingleAddress(t *testing.T) {
+	t.Parallel()
+	spec := validSpec()
+	delete(spec, "addresses")
+	spec["address"] = "10.0.0.1"
+	m := &fakeManager{}
+	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(spec)}, log: logr.Discard(), sdwanManager: m}
+
+	if _, err := r.Reconcile(context.Background(), request(object.Added)); err != nil {
+		t.Fatal(err)
+	}
+	if m.upserts != 1 || len(m.endpoints) != 1 || m.endpoints[0] != "10.0.0.1" {
+		t.Fatalf("upserted %d times with %v, want once with [10.0.0.1]", m.upserts, m.endpoints)
+	}
+}
