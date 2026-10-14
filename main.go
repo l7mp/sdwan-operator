@@ -246,6 +246,19 @@ func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.R
 	case object.Deleted:
 		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
 
+		// A delete retried after the object was created again must not remove
+		// the new object's SD-WAN resources. The view cache drops an object
+		// before it reports the delete, so a found object is a new one.
+		obj := object.NewViewObject("sdwan-operator", req.GVK.Kind)
+		err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj)
+		if err == nil {
+			r.log.Info("SD-WAN tunnel policy created again, skipping delete", "name", req.Name, "namespace", req.Namespace)
+			return nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check deleted object: %w", err)
+		}
+
 		if err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name); err != nil {
 			return fmt.Errorf("failed to delete SD-WAN resources: %w", err)
 		}

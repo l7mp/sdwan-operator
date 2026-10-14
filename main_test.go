@@ -52,9 +52,12 @@ type fakeClient struct {
 	err error
 }
 
-func (c *fakeClient) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+func (c *fakeClient) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
 	if c.err != nil {
 		return c.err
+	}
+	if c.obj == nil {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "tunnelpolicyviews"}, key.Name)
 	}
 	u := obj.(*unstructured.Unstructured)
 	gvk := u.GroupVersionKind()
@@ -89,6 +92,7 @@ func request(event object.DeltaType) dreconciler.Request {
 func TestReconcileRetries(t *testing.T) {
 	t.Parallel()
 	transient := errors.New("vManage unreachable")
+	gone := apierrors.NewNotFound(schema.GroupResource{Resource: "tunnelpolicyviews"}, "app-TCP-80")
 	for _, tc := range []struct {
 		name     string
 		event    object.DeltaType
@@ -103,10 +107,11 @@ func TestReconcileRetries(t *testing.T) {
 		{"upsert with invalid tunnel", object.Updated, validSpec(), nil, sdwan.ErrInvalidSpec, false, true},
 		{"spec without protocol", object.Added, map[string]any{"targetPort": int64(8080), "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, true},
 		{"named port", object.Added, map[string]any{"targetPort": "http", "protocol": "TCP", "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, true},
-		{"object gone", object.Upserted, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "tunnelpolicyviews"}, "app-TCP-80"), nil, false, false},
+		{"object gone", object.Upserted, nil, gone, nil, false, false},
 		{"get fails", object.Added, nil, transient, nil, true, false},
-		{"delete ok", object.Deleted, nil, nil, nil, false, false},
-		{"delete fails", object.Deleted, nil, nil, transient, true, false},
+		{"delete ok", object.Deleted, nil, gone, nil, false, false},
+		{"delete fails", object.Deleted, nil, gone, transient, true, false},
+		{"delete cannot check the object", object.Deleted, nil, transient, nil, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -331,5 +336,20 @@ func TestReconcileReadsSingleAddress(t *testing.T) {
 	}
 	if m.upserts != 1 || len(m.endpoints) != 1 || m.endpoints[0] != "10.0.0.1" {
 		t.Fatalf("upserted %d times with %v, want once with [10.0.0.1]", m.upserts, m.endpoints)
+	}
+}
+
+// A failed delete is retried with backoff. If the object was created again by
+// then, the retry removed the new object's list and sequences.
+func TestRetriedDeleteSparesRecreatedObject(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{}
+	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(validSpec())}, log: logr.Discard(), sdwanManager: m}
+
+	if _, err := r.Reconcile(context.Background(), request(object.Deleted)); err != nil {
+		t.Fatal(err)
+	}
+	if m.deletes != 0 {
+		t.Fatalf("delete of a recreated object removed its SD-WAN resources")
 	}
 }
