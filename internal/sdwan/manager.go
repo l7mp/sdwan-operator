@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -32,6 +33,22 @@ const (
 // every request gets HTTP 200 with the HTML login page, which go-sdwan
 // reports as success with an empty body.
 var errInvalidResponse = errors.New("unexpected vManage response (session expired?)")
+
+// statusRe matches the HTTP status in the errors of go-sdwan, which has no
+// error type for it.
+var statusRe = regexp.MustCompile(`HTTP Request failed: StatusCode (\d{3})`)
+
+// rejected tells if vManage refused a call for what it was asked to do: a 4xx
+// status other than a timeout or a rate limit. Any other error, like an
+// expired session or a 5xx status, would fail the other calls too.
+func rejected(err error) bool {
+	m := statusRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	code, _ := strconv.Atoi(m[1])
+	return code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests
+}
 
 // ErrInvalidSpec is returned for a tunnel policy that cannot be applied as
 // specified, so retrying it does not help.
@@ -251,16 +268,26 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	}
 
 	// No sequence uses a new list yet: create it before the central policy
-	// is deactivated, to keep the time without a policy short.
+	// is deactivated, to keep the time without a policy short. A list vManage
+	// rejects fails only its change.
+	kept := changed[:0:0]
 	for _, u := range changed {
-		if u.delete() || u.listID != "" {
-			continue
+		if !u.delete() && u.listID == "" {
+			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+				if !rejected(err) {
+					return fail(err, changed)
+				}
+				errs[u.idx] = err
+				continue
+			}
+			u.listID = m.objectCache["dataprefix"][u.objName]
+			u.created = true
 		}
-		if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
-			return fail(err, changed)
-		}
-		u.listID = m.objectCache["dataprefix"][u.objName]
-		u.created = true
+		kept = append(kept, u)
+	}
+	changed = kept
+	if len(changed) == 0 {
+		return errs
 	}
 
 	endpoint := "/template/policy/definition/approute/" + approuteID
@@ -277,11 +304,26 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	// failed after the sequences were removed, need no cycle.
 	if modified {
 		err := m.applyChange(fmt.Sprintf("%d change(s)", len(changed)), func() error {
+			// A change whose list vManage rejects keeps its old list and
+			// sequences: new sequences over the old list would pair a new
+			// port, protocol or tunnel with the old endpoints.
+			kept := changed[:0:0]
 			for _, u := range changed {
-				if u.delete() || u.created {
-					continue
+				if !u.delete() && !u.created {
+					if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+						if !rejected(err) {
+							return err
+						}
+						errs[u.idx] = err
+						continue
+					}
 				}
-				if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+				kept = append(kept, u)
+			}
+			if len(kept) < len(changed) {
+				changed = kept
+				var err error
+				if newDef, modified, err = replaceSequences(def, changed); err != nil || !modified {
 					return err
 				}
 			}

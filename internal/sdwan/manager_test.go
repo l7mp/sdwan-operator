@@ -38,8 +38,13 @@ type fakeVManage struct {
 	// tasksBroken makes the task list return the login page even with a
 	// valid session.
 	tasksBroken bool
-	// fail makes the API calls starting with this "METHOD path" fail.
-	fail string
+	// fail makes the API calls starting with this "METHOD path" fail with
+	// failStatus, 500 if unset.
+	fail       string
+	failStatus int
+	// rejectList makes POSTs and PUTs of the dataprefix list of this name
+	// fail with 400, as vManage rejects a list it finds invalid.
+	rejectList string
 	// loginPageFor makes the API calls starting with this "METHOD path"
 	// return the login page, as after a session ends.
 	loginPageFor string
@@ -113,7 +118,16 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/dataservice")
 	f.calls = append(f.calls, r.Method+" "+path)
 	if f.fail != "" && strings.HasPrefix(r.Method+" "+path, f.fail) {
-		http.Error(w, "failing "+f.fail, http.StatusInternalServerError)
+		status := f.failStatus
+		if status == 0 {
+			status = http.StatusInternalServerError
+		}
+		http.Error(w, "failing "+f.fail, status)
+		return
+	}
+	if f.rejectList != "" && (r.Method == http.MethodPost || r.Method == http.MethodPut) &&
+		strings.HasPrefix(path, "/template/policy/list/dataprefix/") && gjson.GetBytes(body, "name").String() == f.rejectList {
+		http.Error(w, `{"error":{"message":"invalid list"}}`, http.StatusBadRequest)
 		return
 	}
 	if f.loginPageFor != "" && strings.HasPrefix(r.Method+" "+path, f.loginPageFor) {
@@ -1178,6 +1192,94 @@ func TestFailedListDeleteFailsOnlyItsChange(t *testing.T) {
 	calls = calls[len(before):]
 	if callIndex(calls, "POST /template/policy/vsmart/") >= 0 || !slices.Contains(calls, "DELETE /template/policy/list/dataprefix/"+id) {
 		t.Fatalf("retried delete toggled the central policy or kept the list; calls: %q", calls)
+	}
+}
+
+// A list vManage rejects fails only its change: the rest of the batch goes
+// ahead in the same cycle. A rejected update of an existing list keeps the
+// service's old sequences, which still match the old list.
+func TestRejectedListFailsOnlyItsChange(t *testing.T) {
+	t.Parallel()
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing list %v", existing), func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+			if existing {
+				checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")}))
+			}
+			f.mu.Lock()
+			f.rejectList = "default___app-1"
+			f.mu.Unlock()
+			_, before := f.state()
+
+			changed := appChange("app-1", "10.0.1.1")
+			changed.TargetPort = 9090
+			errs := m.Apply([]Change{changed, appChange("app-2", "10.0.1.2")})
+			if errs[0] == nil || !strings.Contains(errs[0].Error(), "StatusCode 400") || errs[1] != nil {
+				t.Fatalf("errors %v, want only the rejected list's change to fail", errs)
+			}
+			_, calls := f.state()
+			calls = calls[len(before):]
+			if d, a := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"), countCalls(calls, "POST /template/policy/vsmart/activate/cp-1"); d != 1 || a != 1 {
+				t.Fatalf("%d deactivates and %d activates, want 1 each; calls: %q", d, a, calls)
+			}
+			def := f.approuteDefinition()
+			lists := f.lists()
+			if !f.usesList(lists["default___app-2"]) {
+				t.Fatalf("app-2 not applied: %s", def)
+			}
+			id, ok := lists["default___app-1"]
+			if !existing {
+				if ok {
+					t.Fatalf("rejected list created: %v", lists)
+				}
+				return
+			}
+			// the second match entry is the port (generateSeqRule)
+			ports := gjson.Get(def, `sequences.#(match.entries.0.ref=="`+id+`")#.match.entries.1.value`).Array()
+			if len(ports) != 2 || ports[0].String() != "8080" || ports[1].String() != "8080" {
+				t.Fatalf("app-1 lost its old sequences: %s", def)
+			}
+		})
+	}
+}
+
+// An error that would hit any call fails the batch before the central policy
+// is toggled.
+func TestListErrorFailsBatch(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.fail = "POST /template/policy/list/dataprefix/"
+	m := newTestManager(t, ts.URL)
+
+	errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
+	if errs[0] == nil || errs[1] == nil {
+		t.Fatalf("errors %v, want the batch to fail", errs)
+	}
+	if _, calls := f.state(); callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
+		t.Fatalf("central policy toggled for a failed batch; calls: %q", calls)
+	}
+}
+
+func TestRejected(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{errors.New("HTTP Request failed: StatusCode 400"), true},
+		{errors.New("HTTP Request failed: StatusCode 404"), true},
+		{fmt.Errorf("upsert: %w", errors.New("HTTP Request failed: StatusCode 409")), true},
+		{errors.New("HTTP Request failed: StatusCode 408"), false},
+		{errors.New("HTTP Request failed: StatusCode 429"), false},
+		{errors.New("HTTP Request failed: StatusCode 500"), false},
+		{errors.New("JSON error: {}"), false},
+		{errInvalidResponse, false},
+	} {
+		if got := rejected(tc.err); got != tc.want {
+			t.Errorf("rejected(%q) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 
