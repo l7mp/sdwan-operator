@@ -49,9 +49,22 @@ var protocolNumbers = map[string]int32{
 	"SCTP": 132,
 }
 
+// Change is the SD-WAN state a Kubernetes object asks for: its endpoints
+// routed over the tunnel, or, if Delete is set, nothing.
+type Change struct {
+	Namespace, Name string
+	Delete          bool
+	Endpoints       []string
+	TargetPort      int64
+	Protocol        string
+	Tunnel          string
+}
+
 type Manager interface {
-	HandleDeleteEvent(namespace, name string) error
-	HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error
+	// Apply makes the changes in one deactivate/activate cycle of the
+	// central policy, at most one change per object. It returns the error of
+	// each change, in order: nil for a change that was made.
+	Apply(changes []Change) []error
 }
 
 func NewManager(c Config, log logr.Logger) (Manager, error) {
@@ -86,10 +99,14 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 // a dry run finds invalid specs.
 type nullManager struct{}
 
-func (m *nullManager) HandleDeleteEvent(_, _ string) error { return nil }
-func (m *nullManager) HandleUpsertEvent(_, _ string, endpoints []string, _ int64, protocol, tunnel string) error {
-	_, _, err := checkUpsert(endpoints, protocol, tunnel)
-	return err
+func (m *nullManager) Apply(changes []Change) []error {
+	errs := make([]error, len(changes))
+	for i, c := range changes {
+		if !c.Delete {
+			_, _, errs[i] = checkUpsert(c.Endpoints, c.Protocol, c.Tunnel)
+		}
+	}
+	return errs
 }
 
 type sdwanManager struct {
@@ -136,119 +153,145 @@ func (m *sdwanManager) refreshCache() error {
 	return nil
 }
 
-func (m *sdwanManager) HandleDeleteEvent(namespace, name string) error {
-	objName := convertK8sNameToSdWan(namespace, name)
-
-	if err := m.ensureSession(); err != nil {
-		return err
-	}
-
-	if err := m.refreshCache(); err != nil {
-		return err
-	}
-
-	// det dataprefixlist ids
-	var dpids []string
-	if dpid, ok := m.objectCache["dataprefix"][objName]; ok {
-		dpids = append(dpids, dpid)
-	}
-	if dpid := m.legacyListID(namespace, name); dpid != "" {
-		dpids = append(dpids, dpid)
-	}
-	if len(dpids) == 0 {
-		m.log.Info("no dataprefix list to delete", "name", objName)
-		return nil
-	}
-
-	// update approte seq rules
-	id, ok := m.objectCache["approute"][ApproutePolicyName]
-	if !ok {
-		return errors.New("fail to get approute id")
-	}
-
-	return m.applyChange("delete", func() error {
-		endpoint := "/template/policy/definition/approute/" + id
-		data, err := m.filterSequenceRules(endpoint, dpids...)
-		if err != nil {
-			return err
-		}
-
-		res, err := m.client.Put(endpoint, data)
-		if err != nil {
-			return err
-		}
-		m.log.Info(fmt.Sprintf("PUT %s: %s", endpoint, res))
-
-		// delete dataprefix
-		for _, dpid := range dpids {
-			if err := m.deleteDataPrefixList(dpid); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+// update is a change that passed the checks, with what vManage needs for it.
+type update struct {
+	// idx is the index of the change in the batch.
+	idx             int
+	namespace, name string
+	objName         string
+	// listData is the dataprefix list to upsert, "" to delete the list.
+	listData            string
+	port, proto, tunnel string
+	// listID and legacyID are the ids of the object's list and of its list
+	// from before names were hashed, "" if it has none.
+	listID, legacyID string
 }
 
-func (m *sdwanManager) HandleUpsertEvent(namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
-	objName := convertK8sNameToSdWan(namespace, name)
+func (u *update) delete() bool { return u.listData == "" }
 
-	ipv4, protoNum, err := checkUpsert(endpoints, protocol, tunnel)
-	if err != nil {
-		return err
+// prepare checks a change and returns the update that makes it.
+func (m *sdwanManager) prepare(c Change) (*update, error) {
+	u := &update{namespace: c.Namespace, name: c.Name, objName: convertK8sNameToSdWan(c.Namespace, c.Name)}
+	if c.Delete {
+		return u, nil
 	}
-	if len(ipv4) < len(endpoints) {
-		m.log.Info("skipping IPv6 endpoints: approute sequences match IPv4 only", "name", objName)
+
+	ipv4, protoNum, err := checkUpsert(c.Endpoints, c.Protocol, c.Tunnel)
+	if err != nil {
+		return nil, err
+	}
+	if len(ipv4) < len(c.Endpoints) {
+		m.log.Info("skipping IPv6 endpoints: approute sequences match IPv4 only", "name", u.objName)
 	}
 	// Without endpoints there is nothing to route: remove the service's list
 	// rather than sending vManage an empty one.
 	if len(ipv4) == 0 {
-		return m.HandleDeleteEvent(namespace, name)
+		return u, nil
 	}
 
-	listData, err := m.generateDataPrefixList(objName, ipv4)
-	if err != nil {
-		return err
+	if u.listData, err = m.generateDataPrefixList(u.objName, ipv4); err != nil {
+		return nil, err
+	}
+	u.port = strconv.Itoa(int(c.TargetPort))
+	u.proto = strconv.Itoa(int(protoNum))
+	u.tunnel = c.Tunnel
+	return u, nil
+}
+
+func (m *sdwanManager) Apply(changes []Change) []error {
+	errs := make([]error, len(changes))
+	var updates []*update
+	for i, c := range changes {
+		u, err := m.prepare(c)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		u.idx = i
+		updates = append(updates, u)
+	}
+	if len(updates) == 0 {
+		return errs
+	}
+	fail := func(err error, us []*update) []error {
+		for _, u := range us {
+			errs[u.idx] = err
+		}
+		return errs
 	}
 
 	if err := m.ensureSession(); err != nil {
-		return err
+		return fail(err, updates)
 	}
 
 	if err := m.refreshCache(); err != nil {
-		return err
+		return fail(err, updates)
 	}
 
 	// a change that cannot succeed must not toggle the central policy
-	if _, ok := m.objectCache["approute"][ApproutePolicyName]; !ok {
-		return errors.New("fail to get approute")
+	approuteID, ok := m.objectCache["approute"][ApproutePolicyName]
+	if !ok {
+		return fail(errors.New("fail to get approute"), updates)
 	}
 
-	port := strconv.Itoa(int(targetPort))
-	proto := strconv.Itoa(int(protoNum))
-	legacyID := m.legacyListID(namespace, name)
+	var changed []*update
+	for _, u := range updates {
+		u.listID = m.objectCache["dataprefix"][u.objName]
+		u.legacyID = m.legacyListID(u.namespace, u.name)
+		if u.delete() && u.listID == "" && u.legacyID == "" {
+			m.log.Info("no dataprefix list to delete", "name", u.objName)
+			continue
+		}
+		changed = append(changed, u)
+	}
+	if len(changed) == 0 {
+		return errs
+	}
 
-	return m.applyChange("upsert", func() error {
+	err := m.applyChange(fmt.Sprintf("%d change(s)", len(changed)), func() error {
 		// dataprefix
-		if err := m.upsertDataPrefixList(objName, listData); err != nil {
-			return err
+		for _, u := range changed {
+			if u.delete() {
+				continue
+			}
+			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+				return err
+			}
+			u.listID = m.objectCache["dataprefix"][u.objName]
 		}
 
 		// approute
-		if err := m.updateApproute(objName, port, proto, tunnel, legacyID); err != nil {
+		if err := m.updateApproute(approuteID, changed); err != nil {
 			return err
 		}
 
-		// The list from before names were hashed is unused now. If vManage
-		// keeps it (e.g. another policy uses it), it routes nothing for us,
-		// so failing, and retrying, the change would not help.
-		if legacyID != "" {
-			if err := m.deleteDataPrefixList(legacyID); err != nil {
-				m.log.Error(err, "cannot delete legacy dataprefix list, leaving it", "id", legacyID)
+		for _, u := range changed {
+			if u.delete() && u.listID != "" {
+				if err := m.deleteDataPrefixList(u.listID); err != nil {
+					return err
+				}
+			}
+			if u.legacyID == "" {
+				continue
+			}
+			// The list from before names were hashed is unused now. If
+			// vManage keeps it (e.g. another policy uses it), it routes
+			// nothing for us, so failing, and retrying, an upsert would not
+			// help.
+			if err := m.deleteDataPrefixList(u.legacyID); err != nil {
+				if u.delete() {
+					return err
+				}
+				m.log.Error(err, "cannot delete legacy dataprefix list, leaving it", "id", u.legacyID)
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return fail(err, changed)
+	}
+
+	return errs
 }
 
 // legacyListID returns the id of the list a Kubernetes object has in vManage
@@ -315,24 +358,18 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 	return nil
 }
 
-// updateApproute replaces the approute sequences of a dataprefix list, and
-// removes those of the legacy list with the id legacyID, unless that is "".
-func (m *sdwanManager) updateApproute(objName, port, proto, tunnel, legacyID string) error {
-	dataPrefixList, ok := m.objectCache["dataprefix"][objName]
-	if !ok {
-		return errors.New("fail to get dataprefix")
-	}
-
-	id, ok := m.objectCache["approute"][ApproutePolicyName]
-	if !ok {
-		return errors.New("fail to get approute")
-	}
-
-	// get approute without existing seq rules matchin on the dataprefix
+// updateApproute replaces the approute sequences of the updates: it removes
+// those of their lists and legacy lists, and adds those of the upserts.
+func (m *sdwanManager) updateApproute(id string, updates []*update) error {
+	// get approute without existing seq rules matching on the lists
 	endpoint := "/template/policy/definition/approute/" + id
-	stale := []string{dataPrefixList}
-	if legacyID != "" {
-		stale = append(stale, legacyID)
+	var stale []string
+	for _, u := range updates {
+		for _, l := range []string{u.listID, u.legacyID} {
+			if l != "" {
+				stale = append(stale, l)
+			}
+		}
 	}
 	desc, err := m.filterSequenceRules(endpoint, stale...)
 	if err != nil {
@@ -352,13 +389,19 @@ func (m *sdwanManager) updateApproute(objName, port, proto, tunnel, legacyID str
 
 	// install new seqrules
 	data := desc
-	for i, direction := range []string{"source", "destination"} {
-		rule, err := generateSeqRule(sid+i, direction, dataPrefixList, port, proto, tunnel)
-		if err != nil {
-			return err
+	for _, u := range updates {
+		if u.delete() {
+			continue
 		}
-		if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
-			return err
+		for _, direction := range []string{"source", "destination"} {
+			rule, err := generateSeqRule(sid, direction, u.listID, u.port, u.proto, u.tunnel)
+			if err != nil {
+				return err
+			}
+			if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
+				return err
+			}
+			sid++
 		}
 	}
 

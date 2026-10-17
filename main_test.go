@@ -34,15 +34,18 @@ type fakeManager struct {
 	endpoints        []string
 }
 
-func (m *fakeManager) HandleDeleteEvent(_, _ string) error {
-	m.deletes++
-	return m.err
-}
-
-func (m *fakeManager) HandleUpsertEvent(_, _ string, endpoints []string, _ int64, _, _ string) error {
-	m.upserts++
-	m.endpoints = endpoints
-	return m.err
+func (m *fakeManager) Apply(changes []sdwan.Change) []error {
+	errs := make([]error, len(changes))
+	for i, c := range changes {
+		if c.Delete {
+			m.deletes++
+		} else {
+			m.upserts++
+			m.endpoints = c.Endpoints
+		}
+		errs[i] = m.err
+	}
+	return errs
 }
 
 // fakeClient serves a single object, or fails with err.

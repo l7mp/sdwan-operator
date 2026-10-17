@@ -305,8 +305,18 @@ func newTestManager(t *testing.T, url string) *sdwanManager {
 	}
 }
 
+// upsertOne applies an upsert on its own.
+func upsertOne(m Manager, namespace, name string, endpoints []string, targetPort int64, protocol, tunnel string) error {
+	return m.Apply([]Change{{Namespace: namespace, Name: name, Endpoints: endpoints, TargetPort: targetPort, Protocol: protocol, Tunnel: tunnel}})[0]
+}
+
+// deleteOne applies a delete on its own.
+func deleteOne(m Manager, namespace, name string) error {
+	return m.Apply([]Change{{Namespace: namespace, Name: name, Delete: true}})[0]
+}
+
 func upsert(m *sdwanManager) error {
-	return m.HandleUpsertEvent("default", "llamacpp-backends", []string{"10.10.1.159", "10.10.0.22"}, 50052, "TCP", "biz-internet")
+	return upsertOne(m, "default", "llamacpp-backends", []string{"10.10.1.159", "10.10.0.22"}, 50052, "TCP", "biz-internet")
 }
 
 // An expired vManage session made the operator hang in waitTasksFinish
@@ -359,7 +369,7 @@ func TestDeleteAfterSessionExpiry(t *testing.T) {
 	}
 	f.expire()
 
-	if err := m.HandleDeleteEvent("default", "llamacpp-backends"); err != nil {
+	if err := deleteOne(m, "default", "llamacpp-backends"); err != nil {
 		t.Fatalf("delete after session expiry: %v", err)
 	}
 	if logins, calls := f.state(); logins != 2 || !slices.Contains(calls, "DELETE /template/policy/list/dataprefix/dp-1") {
@@ -546,7 +556,7 @@ func TestListsOfSimilarNamesStayApart(t *testing.T) {
 	m := newTestManager(t, ts.URL)
 	upsertApp := func(name, address string) {
 		t.Helper()
-		if err := m.HandleUpsertEvent("default", name, []string{address}, 8080, "TCP", "biz-internet"); err != nil {
+		if err := upsertOne(m, "default", name, []string{address}, 8080, "TCP", "biz-internet"); err != nil {
 			t.Fatalf("upsert %s: %v", name, err)
 		}
 	}
@@ -564,7 +574,7 @@ func TestListsOfSimilarNamesStayApart(t *testing.T) {
 	}
 
 	_, before := f.state()
-	if err := m.HandleDeleteEvent("default", "business-app-10"); err != nil {
+	if err := deleteOne(m, "default", "business-app-10"); err != nil {
 		t.Fatalf("delete business-app-10: %v", err)
 	}
 	_, calls := f.state()
@@ -606,7 +616,7 @@ func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
 
 			var err error
 			if tc.delete {
-				err = m.HandleDeleteEvent("default", "llamacpp-backends")
+				err = deleteOne(m, "default", "llamacpp-backends")
 			} else {
 				err = upsert(m)
 			}
@@ -630,7 +640,7 @@ func TestDeleteOfUnknownListLeavesCentralPolicyAlone(t *testing.T) {
 	f, ts := newFakeVManage(t)
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleDeleteEvent("default", "unknown"); err != nil {
+	if err := deleteOne(m, "default", "unknown"); err != nil {
 		t.Fatalf("delete of a service without a list: %v", err)
 	}
 	if _, calls := f.state(); slices.ContainsFunc(calls, func(c string) bool { return strings.HasPrefix(c, "POST /template/policy/vsmart/") }) {
@@ -672,7 +682,7 @@ func TestUpsertSendsValidApproute(t *testing.T) {
 	f, ts := newFakeVManage(t)
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet mpls"); err != nil {
+	if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet mpls"); err != nil {
 		t.Fatal(err)
 	}
 	def := f.approuteDefinition()
@@ -717,7 +727,7 @@ func TestUpsertRejectsInvalidSpec(t *testing.T) {
 			f, ts := newFakeVManage(t)
 			m := newTestManager(t, ts.URL)
 
-			err := m.HandleUpsertEvent("default", "app", []string{tc.address}, 8080, tc.protocol, tc.tunnel)
+			err := upsertOne(m, "default", "app", []string{tc.address}, 8080, tc.protocol, tc.tunnel)
 			if !errors.Is(err, ErrInvalidSpec) {
 				t.Fatalf("expected ErrInvalidSpec, got %v", err)
 			}
@@ -752,9 +762,9 @@ func TestLegacyListsAreRemoved(t *testing.T) {
 
 			var err error
 			if tc.delete {
-				err = m.HandleDeleteEvent("default", tc.service)
+				err = deleteOne(m, "default", tc.service)
 			} else {
-				err = m.HandleUpsertEvent("default", tc.service, []string{"10.0.0.1"}, 8080, "TCP", "biz-internet")
+				err = upsertOne(m, "default", tc.service, []string{"10.0.0.1"}, 8080, "TCP", "biz-internet")
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -781,7 +791,7 @@ func TestLegacyListOfAnotherServiceIsKept(t *testing.T) {
 	f.addLegacyList(t, "default___llamacpp-ba-1140021977", "dp-legacy")
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleUpsertEvent("default", "llamacpp-backends-TCP-50052", []string{"10.0.0.1"}, 50052, "TCP", "biz-internet"); err != nil {
+	if err := upsertOne(m, "default", "llamacpp-backends-TCP-50052", []string{"10.0.0.1"}, 50052, "TCP", "biz-internet"); err != nil {
 		t.Fatal(err)
 	}
 	lists := f.lists()
@@ -801,7 +811,7 @@ func TestShortNamesHaveNoLegacyList(t *testing.T) {
 	f.addLegacyList(t, "default___app-backend", "dp-other")
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+	if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.lists()["default___app-backend"]; !ok || !f.usesList("dp-other") {
@@ -821,7 +831,7 @@ func TestUpsertWithoutEndpointsRemovesList(t *testing.T) {
 	id := f.lists()[convertK8sNameToSdWan("default", "llamacpp-backends")]
 
 	for i := range 2 { // the second time there is nothing left to remove
-		if err := m.HandleUpsertEvent("default", "llamacpp-backends", []string{}, 50052, "TCP", "biz-internet"); err != nil {
+		if err := upsertOne(m, "default", "llamacpp-backends", []string{}, 50052, "TCP", "biz-internet"); err != nil {
 			t.Fatalf("upsert %d without endpoints: %v", i+1, err)
 		}
 		if lists := f.lists(); len(lists) != 0 || f.usesList(id) {
@@ -838,7 +848,7 @@ func TestUpsertProtocolNumbers(t *testing.T) {
 			f, ts := newFakeVManage(t)
 			m := newTestManager(t, ts.URL)
 
-			if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, protocol, "biz-internet"); err != nil {
+			if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, protocol, "biz-internet"); err != nil {
 				t.Fatal(err)
 			}
 			got := gjson.Get(f.approuteDefinition(), `sequences.#.match.entries.#(field=="protocol").value`).Array()
@@ -882,7 +892,7 @@ func TestUpsertSkipsIPv6Endpoints(t *testing.T) {
 	f, ts := newFakeVManage(t)
 	m := newTestManager(t, ts.URL)
 
-	if err := m.HandleUpsertEvent("default", "app", []string{"fd00::1", "10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+	if err := upsertOne(m, "default", "app", []string{"fd00::1", "10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
 		t.Fatal(err)
 	}
 	id := f.lists()["default___app"]
@@ -891,7 +901,7 @@ func TestUpsertSkipsIPv6Endpoints(t *testing.T) {
 	}
 
 	// with only IPv6 endpoints left there is nothing to route
-	if err := m.HandleUpsertEvent("default", "app", []string{"fd00::1"}, 8080, "TCP", "biz-internet"); err != nil {
+	if err := upsertOne(m, "default", "app", []string{"fd00::1"}, 8080, "TCP", "biz-internet"); err != nil {
 		t.Fatal(err)
 	}
 	if lists := f.lists(); len(lists) != 0 || f.usesList(id) {
@@ -907,13 +917,13 @@ func TestDryRunRejectsInvalidSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
+	if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, "TCP", "biz-internet"); err != nil {
 		t.Fatalf("dry run rejects a valid spec: %v", err)
 	}
-	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "TCP", "Biz-Internet"); !errors.Is(err, ErrInvalidSpec) {
+	if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, "TCP", "Biz-Internet"); !errors.Is(err, ErrInvalidSpec) {
 		t.Fatalf("dry run accepts an invalid tunnel: %v", err)
 	}
-	if err := m.HandleUpsertEvent("default", "app", []string{"10.0.0.1"}, 8080, "ICMP", "biz-internet"); !errors.Is(err, ErrInvalidSpec) {
+	if err := upsertOne(m, "default", "app", []string{"10.0.0.1"}, 8080, "ICMP", "biz-internet"); !errors.Is(err, ErrInvalidSpec) {
 		t.Fatalf("dry run accepts an unknown protocol: %v", err)
 	}
 }
@@ -969,6 +979,121 @@ func TestRefreshCacheLogsCacheOnlyVerbose(t *testing.T) {
 	defer mu.Unlock()
 	if slices.ContainsFunc(logs, func(l string) bool { return strings.Contains(l, "object cache: map") }) {
 		t.Fatalf("full cache logged at the default verbosity: %q", logs)
+	}
+}
+
+func appChange(name, address string) Change {
+	return Change{Namespace: "default", Name: name, Endpoints: []string{address}, TargetPort: 8080, Protocol: "TCP", Tunnel: "biz-internet"}
+}
+
+func checkNoErrors(t *testing.T, errs []error) {
+	t.Helper()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("change %d: %v", i, err)
+		}
+	}
+}
+
+// Every change deactivated and activated the central policy, so N changes
+// took N cycles of ≈ 17 s on the testbed.
+func TestApplyBatchInOneCycle(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	var batch []Change
+	for i := range 5 {
+		batch = append(batch, appChange(fmt.Sprintf("app-%d", i), fmt.Sprintf("10.0.0.%d", i+1)))
+	}
+
+	checkNoErrors(t, m.Apply(batch))
+	_, calls := f.state()
+	if d, a := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"), countCalls(calls, "POST /template/policy/vsmart/activate/cp-1"); d != 1 || a != 1 {
+		t.Fatalf("%d deactivates and %d activates for a batch, want 1 each", d, a)
+	}
+	if n := countCalls(calls, "PUT /template/policy/definition/approute/ar-1"); n != 1 {
+		t.Fatalf("%d approute PUTs for a batch, want 1", n)
+	}
+	lists := f.lists()
+	seqs := gjson.Get(f.approuteDefinition(), "sequences").Array()
+	if len(lists) != 5 || len(seqs) != 10 {
+		t.Fatalf("%d lists and %d sequences, want 5 and 10: %s", len(lists), len(seqs), f.approuteDefinition())
+	}
+	ids := map[int64]bool{}
+	for _, s := range seqs {
+		ids[s.Get("sequenceId").Int()] = true
+	}
+	if len(ids) != len(seqs) {
+		t.Fatalf("sequence ids not unique: %s", f.approuteDefinition())
+	}
+	for i := range 5 {
+		if id := lists[convertK8sNameToSdWan("default", fmt.Sprintf("app-%d", i))]; !f.usesList(id) {
+			t.Fatalf("app-%d has no sequences", i)
+		}
+	}
+
+	// upserts of existing and new services, and deletes, in one batch
+	_, before := f.state()
+	batch = []Change{
+		appChange("app-0", "10.0.1.1"),
+		{Namespace: "default", Name: "app-1", Delete: true},
+		appChange("app-new", "10.0.1.2"),
+		{Namespace: "default", Name: "app-2", Endpoints: []string{}, TargetPort: 8080, Protocol: "TCP", Tunnel: "biz-internet"},
+	}
+	checkNoErrors(t, m.Apply(batch))
+	_, calls = f.state()
+	calls = calls[len(before):]
+	if d, a := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"), countCalls(calls, "POST /template/policy/vsmart/activate/cp-1"); d != 1 || a != 1 {
+		t.Fatalf("%d deactivates and %d activates for a mixed batch, want 1 each", d, a)
+	}
+	lists = f.lists()
+	if len(lists) != 4 {
+		t.Fatalf("lists after the mixed batch: %v", lists)
+	}
+	for _, name := range []string{"app-0", "app-3", "app-4", "app-new"} {
+		if id := lists[convertK8sNameToSdWan("default", name)]; id == "" || !f.usesList(id) {
+			t.Fatalf("%s has no list or sequences: lists %v, approute %s", name, lists, f.approuteDefinition())
+		}
+	}
+	if n := len(gjson.Get(f.approuteDefinition(), "sequences").Array()); n != 8 {
+		t.Fatalf("%d sequences after the mixed batch, want 8", n)
+	}
+}
+
+// A change with an invalid spec fails on its own: the rest of the batch is
+// applied.
+func TestApplyBatchSkipsInvalidSpec(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	bad := appChange("bad", "10.0.0.2")
+	bad.Tunnel = "Biz-Internet"
+
+	errs := m.Apply([]Change{appChange("good", "10.0.0.1"), bad})
+	if errs[0] != nil || !errors.Is(errs[1], ErrInvalidSpec) {
+		t.Fatalf("errors %v, want nil and ErrInvalidSpec", errs)
+	}
+	lists := f.lists()
+	if len(lists) != 1 || !f.usesList(lists["default___good"]) {
+		t.Fatalf("valid change not applied: lists %v", lists)
+	}
+}
+
+// An error that is not tied to one change fails every change of the batch.
+func TestApplyBatchFailsTogether(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.fail = "PUT /template/policy/definition/approute/"
+	m := newTestManager(t, ts.URL)
+
+	errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
+	for i, err := range errs {
+		if err == nil {
+			t.Fatalf("change %d succeeded despite the failed approute PUT", i)
+		}
+	}
+	if _, calls := f.state(); !slices.Contains(calls, "POST /template/policy/vsmart/activate/cp-1") {
+		t.Fatalf("central policy not activated after the failed batch; calls: %q", calls)
 	}
 }
 

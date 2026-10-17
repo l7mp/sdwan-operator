@@ -270,7 +270,8 @@ func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.R
 			return fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
 		}
 
-		if err := r.sdwanManager.HandleUpsertEvent(namespace, name, endpoints, port, protocol, tunnel); err != nil {
+		change := sdwan.Change{Namespace: namespace, Name: name, Endpoints: endpoints, TargetPort: port, Protocol: protocol, Tunnel: tunnel}
+		if err := r.sdwanManager.Apply([]sdwan.Change{change})[0]; err != nil {
 			return fmt.Errorf("failed to upsert SD-WAN resources: %w", err)
 		}
 
@@ -290,7 +291,8 @@ func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.R
 			return fmt.Errorf("failed to check deleted object: %w", err)
 		}
 
-		if err := r.sdwanManager.HandleDeleteEvent(req.Namespace, req.Name); err != nil {
+		change := sdwan.Change{Namespace: req.Namespace, Name: req.Name, Delete: true}
+		if err := r.sdwanManager.Apply([]sdwan.Change{change})[0]; err != nil {
 			return fmt.Errorf("failed to delete SD-WAN resources: %w", err)
 		}
 
