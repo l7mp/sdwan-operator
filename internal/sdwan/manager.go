@@ -187,7 +187,7 @@ type update struct {
 	// listID and legacyID are the ids of the object's list and of its list
 	// from before names were hashed, "" if it has none.
 	listID, legacyID string
-	// created tells if the list was created for this change.
+	// created tells if the change creates the object's list.
 	created bool
 }
 
@@ -262,6 +262,7 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	for _, u := range updates {
 		u.listID = m.objectCache["dataprefix"][u.objName]
 		u.legacyID = m.legacyListID(u.namespace, u.name)
+		u.created = !u.delete() && u.listID == ""
 		if u.delete() && u.listID == "" && u.legacyID == "" {
 			m.log.Info("no dataprefix list to delete", "name", u.objName)
 			continue
@@ -273,24 +274,11 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	}
 
 	// No sequence uses a new list yet: create it before the central policy
-	// is deactivated, to keep the time without a policy short. A list vManage
-	// rejects fails only its change.
-	kept := changed[:0:0]
-	for _, u := range changed {
-		if !u.delete() && u.listID == "" {
-			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
-				if !rejected(err) {
-					return fail(err, changed)
-				}
-				errs[u.idx] = err
-				continue
-			}
-			u.listID = m.objectCache["dataprefix"][u.objName]
-			u.created = true
-		}
-		kept = append(kept, u)
+	// is deactivated, to keep the time without a policy short.
+	changed, err := m.upsertLists(changed, true, errs)
+	if err != nil {
+		return fail(err, changed)
 	}
-	changed = kept
 	if len(changed) == 0 {
 		return errs
 	}
@@ -312,22 +300,12 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 			// A change whose list vManage rejects keeps its old list and
 			// sequences: new sequences over the old list would pair a new
 			// port, protocol or tunnel with the old endpoints.
-			kept := changed[:0:0]
-			for _, u := range changed {
-				if !u.delete() && !u.created {
-					if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
-						if !rejected(err) {
-							return err
-						}
-						errs[u.idx] = err
-						continue
-					}
-				}
-				kept = append(kept, u)
+			kept, err := m.upsertLists(changed, false, errs)
+			if err != nil {
+				return err
 			}
 			if len(kept) < len(changed) {
 				changed = kept
-				var err error
 				if newDef, modified, err = replaceSequences(def, changed); err != nil || !modified {
 					return err
 				}
@@ -365,6 +343,28 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	}
 
 	return errs
+}
+
+// upsertLists creates the lists of the upserts that have none, if created is
+// set, or else updates the lists of the others. It returns the updates whose
+// list vManage did not reject: a rejected list fails only its change, and any
+// other error is returned.
+func (m *sdwanManager) upsertLists(updates []*update, created bool, errs []error) ([]*update, error) {
+	var kept []*update
+	for _, u := range updates {
+		if !u.delete() && u.created == created {
+			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+				if !rejected(err) {
+					return updates, err
+				}
+				errs[u.idx] = err
+				continue
+			}
+			u.listID = m.objectCache["dataprefix"][u.objName]
+		}
+		kept = append(kept, u)
+	}
+	return kept, nil
 }
 
 // legacyListID returns the id of the list a Kubernetes object has in vManage
