@@ -1249,16 +1249,25 @@ func TestRejectedListFailsOnlyItsChange(t *testing.T) {
 // is toggled.
 func TestListErrorFailsBatch(t *testing.T) {
 	t.Parallel()
-	f, ts := newFakeVManage(t)
-	f.fail = "POST /template/policy/list/dataprefix/"
-	m := newTestManager(t, ts.URL)
+	for _, status := range []int{http.StatusInternalServerError, http.StatusForbidden} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			f.fail = "POST /template/policy/list/dataprefix/"
+			f.failStatus = status
+			m := newTestManager(t, ts.URL)
 
-	errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
-	if errs[0] == nil || errs[1] == nil {
-		t.Fatalf("errors %v, want the batch to fail", errs)
-	}
-	if _, calls := f.state(); callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
-		t.Fatalf("central policy toggled for a failed batch; calls: %q", calls)
+			errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
+			if errs[0] == nil || errs[1] == nil {
+				t.Fatalf("errors %v, want the batch to fail", errs)
+			}
+			if _, calls := f.state(); callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
+				t.Fatalf("central policy toggled for a failed batch; calls: %q", calls)
+			}
+			if _, calls := f.state(); countCalls(calls, "POST /template/policy/list/dataprefix/") != 1 {
+				t.Fatalf("batch went on after the first failure; calls: %q", calls)
+			}
+		})
 	}
 }
 
@@ -1271,6 +1280,10 @@ func TestRejected(t *testing.T) {
 		{errors.New("HTTP Request failed: StatusCode 400"), true},
 		{errors.New("HTTP Request failed: StatusCode 404"), true},
 		{fmt.Errorf("upsert: %w", errors.New("HTTP Request failed: StatusCode 409")), true},
+		// go-sdwan does not log in again on these: the session or the
+		// token is gone for every call
+		{errors.New("HTTP Request failed: StatusCode 401"), false},
+		{errors.New("HTTP Request failed: StatusCode 403"), false},
 		{errors.New("HTTP Request failed: StatusCode 408"), false},
 		{errors.New("HTTP Request failed: StatusCode 429"), false},
 		{errors.New("HTTP Request failed: StatusCode 500"), false},

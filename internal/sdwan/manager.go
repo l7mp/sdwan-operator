@@ -39,15 +39,20 @@ var errInvalidResponse = errors.New("unexpected vManage response (session expire
 var statusRe = regexp.MustCompile(`HTTP Request failed: StatusCode (\d{3})`)
 
 // rejected tells if vManage refused a call for what it was asked to do: a 4xx
-// status other than a timeout or a rate limit. Any other error, like an
-// expired session or a 5xx status, would fail the other calls too.
+// status other than an authentication failure, a timeout or a rate limit. Any
+// other error, like an expired session or a 5xx status, would fail the other
+// calls too.
 func rejected(err error) bool {
 	m := statusRe.FindStringSubmatch(err.Error())
 	if m == nil {
 		return false
 	}
 	code, _ := strconv.Atoi(m[1])
-	return code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return code >= 400 && code < 500
 }
 
 // ErrInvalidSpec is returned for a tunnel policy that cannot be applied as
