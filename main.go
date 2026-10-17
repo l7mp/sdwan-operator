@@ -46,10 +46,18 @@ const (
 	SDWANConfigFile                 = "vmanage-config.yaml"
 	apiServerPort                   = 8443
 	maxPort                         = 65535
+	tunnelPolicyKind                = "TunnelPolicyView"
 	retryBaseDelay                  = time.Second
 	retryMaxDelay                   = 5 * time.Minute
-	// maxAttempts is the number of attempts of an event before giving up.
+	// maxAttempts is the number of attempts of a change before giving up.
 	maxAttempts = 10
+	// batchDelay is how long a batch waits for more changes after the first
+	// one, so that a burst of changes makes one batch.
+	batchDelay = time.Second
+	// maxBatch bounds the changes in a batch, so that its cycle, mostly the
+	// two task waits of at most 5 minutes, fits in changeTimeout: each change
+	// takes one or two vManage calls.
+	maxBatch = 50
 	// changeTimeout bounds the wait for a change at shutdown: a change waits
 	// for the vManage tasks twice, at most 5 minutes each.
 	changeTimeout = 11 * time.Minute
@@ -123,16 +131,24 @@ func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, *pol
 	return op, pc, nil
 }
 
-// policyController implements the policy controller
+// policyController applies the tunnel policies to vManage in batches: one
+// cycle of the central policy for all the changes queued since the last one.
 type policyController struct {
 	client.Client
 	log          logr.Logger
 	sdwanManager sdwan.Manager
+	// queue holds the tunnel policies to apply. An object queued while it is
+	// being applied is applied again after, once.
+	queue      workqueue.TypedRateLimitingInterface[types.NamespacedName]
+	batchDelay time.Duration
 	// changing is read-locked while an SD-WAN change is in progress.
 	changing sync.RWMutex
-	// failures counts the failed attempts of each event.
-	failuresMu sync.Mutex
-	failures   map[string]int
+}
+
+func newChangeQueue(baseDelay, maxDelay time.Duration) workqueue.TypedRateLimitingInterface[types.NamespacedName] {
+	return workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[types.NamespacedName](baseDelay, maxDelay),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{Name: "sdwan-changes"})
 }
 
 // waitChanges waits until no SD-WAN change is in progress, for at most
@@ -161,15 +177,19 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 		Client:       mgr.GetClient(),
 		log:          log.WithName("policy-ctrl"),
 		sdwanManager: m,
+		// Every attempt deactivates and activates the central policy, so
+		// retry far less eagerly than the 5ms default.
+		queue:      newChangeQueue(retryBaseDelay, retryMaxDelay),
+		batchDelay: batchDelay,
+	}
+	if err := mgr.Add(manager.RunnableFunc(r.runBatches)); err != nil {
+		return nil, err
 	}
 
 	on := true
 	c, err := controller.NewTyped("sdwan-policy-controller", mgr, controller.TypedOptions[dreconciler.Request]{
 		SkipNameValidation: &on,
 		Reconciler:         r,
-		// Every attempt deactivates and activates the central policy, so
-		// retry far less eagerly than the 5ms default.
-		RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[dreconciler.Request](retryBaseDelay, retryMaxDelay),
 	})
 	if err != nil {
 		return nil, err
@@ -177,7 +197,7 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 
 	src, err := dreconciler.NewSource(mgr, "sdwan-operator", opv1a1.Source{
 		Resource: opv1a1.Resource{
-			Kind: "TunnelPolicyView",
+			Kind: tunnelPolicyKind,
 		},
 	}).GetSource()
 	if err != nil {
@@ -192,115 +212,150 @@ func NewPolicyController(mgr manager.Manager, log logr.Logger, sdwanConf sdwan.C
 	return r, nil
 }
 
-func (r *policyController) Reconcile(ctx context.Context, req dreconciler.Request) (reconcile.Result, error) {
-	r.log.Info("Reconciling", "request", req.String())
+// Reconcile queues a tunnel policy for the next batch. The batch reads its
+// state then, so a policy changed many times in the meantime is applied once.
+func (r *policyController) Reconcile(_ context.Context, req dreconciler.Request) (reconcile.Result, error) {
+	r.log.V(1).Info("Queueing", "request", req.String())
+	r.queue.Add(types.NamespacedName{Namespace: req.Namespace, Name: req.Name})
+	return reconcile.Result{}, nil
+}
+
+// runBatches applies the queued tunnel policies in batches until ctx is done.
+func (r *policyController) runBatches(ctx context.Context) error {
+	go func() {
+		<-ctx.Done()
+		r.queue.ShutDown()
+	}()
+	for r.applyBatch(ctx) {
+	}
+	return nil
+}
+
+// applyBatch applies the next batch of queued tunnel policies. It returns
+// false once the controller is stopping.
+func (r *policyController) applyBatch(ctx context.Context) bool {
+	batch := r.nextBatch(ctx)
+	defer func() {
+		for _, key := range batch {
+			r.queue.Done(key)
+		}
+	}()
+	if len(batch) == 0 || ctx.Err() != nil {
+		return false
+	}
 
 	// A change interrupted between deactivating and activating the central
 	// policy would leave it off: shutdown waits for it.
 	r.changing.RLock()
 	defer r.changing.RUnlock()
 
-	err := r.reconcileEvent(ctx, req)
-	if n := r.countFailure(req, err); n >= maxAttempts {
-		// Every attempt toggles the central policy: give up eventually.
-		err = reconcile.TerminalError(fmt.Errorf("giving up after %d attempts: %w", n, err))
-	}
-	if err != nil {
-		// A policy that cannot be applied as specified is not retried; any
-		// other error is, with backoff.
-		if errors.Is(err, sdwan.ErrInvalidSpec) {
-			err = reconcile.TerminalError(err)
-		}
-		return reconcile.Result{}, err
-	}
-
-	r.log.Info("Reconciliation done")
-
-	return reconcile.Result{}, nil
-}
-
-// countFailure returns the number of failed attempts of the event so far,
-// counting err. It forgets the event when it succeeds or fails for good.
-func (r *policyController) countFailure(req dreconciler.Request, err error) int {
-	key := fmt.Sprintf("%s/%s/%s", req.Namespace, req.Name, req.EventType)
-	r.failuresMu.Lock()
-	defer r.failuresMu.Unlock()
-	if err == nil || errors.Is(err, sdwan.ErrInvalidSpec) {
-		delete(r.failures, key)
-		return 0
-	}
-	if r.failures == nil {
-		r.failures = make(map[string]int)
-	}
-	r.failures[key]++
-	n := r.failures[key]
-	if n >= maxAttempts {
-		delete(r.failures, key)
-	}
-	return n
-}
-
-func (r *policyController) reconcileEvent(ctx context.Context, req dreconciler.Request) error {
-	// vManage update
-	switch req.EventType {
-	case object.Added, object.Updated, object.Upserted:
-		obj := object.NewViewObject("sdwan-operator", req.GVK.Kind)
-		if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj); err != nil {
-			if apierrors.IsNotFound(err) {
-				// deleted since: its delete event removes the SD-WAN resources
-				r.log.Info("SD-WAN tunnel policy gone, skipping", "name", req.Name, "namespace", req.Namespace)
-				return nil
-			}
-			return fmt.Errorf("failed to get added/updated object: %w", err)
-		}
-
-		spec, ok, err := unstructured.NestedMap(obj.Object, "spec")
-		if err != nil || !ok {
-			return fmt.Errorf("%w: failed to look up added/updated object spec: %q", sdwan.ErrInvalidSpec, object.Dump(obj))
-		}
-
-		name := obj.GetName()
-		namespace := obj.GetNamespace()
-
-		r.log.Info("Add/update SD-WAN tunnel policy", "name", name, "namespace", namespace,
-			"spec", fmt.Sprintf("%#v", spec))
-
-		port, protocol, tunnel, endpoints, err := parseSpec(spec)
+	var keys []types.NamespacedName
+	var changes []sdwan.Change
+	for _, key := range batch {
+		change, err := r.currentChange(ctx, key)
 		if err != nil {
-			return fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
+			r.finish(key, err)
+			continue
 		}
-
-		change := sdwan.Change{Namespace: namespace, Name: name, Endpoints: endpoints, TargetPort: port, Protocol: protocol, Tunnel: tunnel}
-		if err := r.sdwanManager.Apply([]sdwan.Change{change})[0]; err != nil {
-			return fmt.Errorf("failed to upsert SD-WAN resources: %w", err)
-		}
-
-	case object.Deleted:
-		r.log.Info("Delete SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace)
-
-		// A delete retried after the object was created again must not remove
-		// the new object's SD-WAN resources. The view cache drops an object
-		// before it reports the delete, so a found object is a new one.
-		obj := object.NewViewObject("sdwan-operator", req.GVK.Kind)
-		err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, obj)
-		if err == nil {
-			r.log.Info("SD-WAN tunnel policy created again, skipping delete", "name", req.Name, "namespace", req.Namespace)
-			return nil
-		}
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to check deleted object: %w", err)
-		}
-
-		change := sdwan.Change{Namespace: req.Namespace, Name: req.Name, Delete: true}
-		if err := r.sdwanManager.Apply([]sdwan.Change{change})[0]; err != nil {
-			return fmt.Errorf("failed to delete SD-WAN resources: %w", err)
-		}
-
-	default:
-		r.log.Info("Unhandled event for SD-WAN tunnel policy", "name", req.Name, "namespace", req.Namespace, "type", req.EventType)
+		keys = append(keys, key)
+		changes = append(changes, change)
+	}
+	if len(changes) == 0 {
+		return true
 	}
 
-	return nil
+	var upserts, deletes []string
+	for _, c := range changes {
+		if c.Delete {
+			deletes = append(deletes, c.Namespace+"/"+c.Name)
+		} else {
+			upserts = append(upserts, c.Namespace+"/"+c.Name)
+		}
+	}
+	r.log.Info("Applying SD-WAN changes", "upserts", upserts, "deletes", deletes)
+
+	errs := r.sdwanManager.Apply(changes)
+	failed := 0
+	for i, key := range keys {
+		if errs[i] != nil {
+			failed++
+		}
+		r.finish(key, errs[i])
+	}
+	r.log.Info("SD-WAN changes applied", "done", len(keys)-failed, "failed", failed)
+
+	return true
+}
+
+// nextBatch waits for a queued tunnel policy, then for more during the
+// batch delay, and returns at most maxBatch of them. It returns nothing once
+// the queue is shut down.
+func (r *policyController) nextBatch(ctx context.Context) []types.NamespacedName {
+	key, shutdown := r.queue.Get()
+	if shutdown {
+		return nil
+	}
+	batch := []types.NamespacedName{key}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(r.batchDelay):
+	}
+	for len(batch) < maxBatch && r.queue.Len() > 0 {
+		key, shutdown := r.queue.Get()
+		if shutdown {
+			break
+		}
+		batch = append(batch, key)
+	}
+	return batch
+}
+
+// currentChange returns the change that applies the current state of a
+// tunnel policy: a delete if it is gone.
+func (r *policyController) currentChange(ctx context.Context, key types.NamespacedName) (sdwan.Change, error) {
+	obj := object.NewViewObject("sdwan-operator", tunnelPolicyKind)
+	if err := r.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return sdwan.Change{Namespace: key.Namespace, Name: key.Name, Delete: true}, nil
+		}
+		return sdwan.Change{}, fmt.Errorf("failed to get tunnel policy: %w", err)
+	}
+
+	spec, ok, err := unstructured.NestedMap(obj.Object, "spec")
+	if err != nil || !ok {
+		return sdwan.Change{}, fmt.Errorf("%w: failed to look up object spec: %q", sdwan.ErrInvalidSpec, object.Dump(obj))
+	}
+	r.log.Info("SD-WAN tunnel policy", "name", key.Name, "namespace", key.Namespace,
+		"spec", fmt.Sprintf("%#v", spec))
+
+	port, protocol, tunnel, endpoints, err := parseSpec(spec)
+	if err != nil {
+		return sdwan.Change{}, fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
+	}
+
+	return sdwan.Change{Namespace: key.Namespace, Name: key.Name, Endpoints: endpoints,
+		TargetPort: port, Protocol: protocol, Tunnel: tunnel}, nil
+}
+
+// finish ends an attempt to apply a tunnel policy. A policy that failed is
+// retried with backoff, unless it cannot be applied as specified, or failed
+// maxAttempts times in a row: every attempt toggles the central policy.
+func (r *policyController) finish(key types.NamespacedName, err error) {
+	attempt := r.queue.NumRequeues(key) + 1
+	switch {
+	case err == nil:
+		r.queue.Forget(key)
+	case errors.Is(err, sdwan.ErrInvalidSpec):
+		r.queue.Forget(key)
+		r.log.Error(err, "invalid SD-WAN tunnel policy, not retrying", "name", key.String())
+	case attempt >= maxAttempts:
+		r.queue.Forget(key)
+		r.log.Error(err, fmt.Sprintf("giving up on SD-WAN tunnel policy after %d attempts", attempt), "name", key.String())
+	default:
+		r.log.Error(err, "SD-WAN tunnel policy failed, retrying", "name", key.String(), "attempt", attempt)
+		r.queue.AddRateLimited(key)
+	}
 }
 
 // parseSpec returns the fields of a tunnel policy spec.

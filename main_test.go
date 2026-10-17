@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,8 +16,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/l7mp/dcontroller/pkg/object"
 	dreconciler "github.com/l7mp/dcontroller/pkg/reconciler"
@@ -27,51 +31,93 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// fakeManager records the SD-WAN changes and fails them with err.
+// fakeManager records the batches it applies. It fails the changes of the
+// objects named in errs, and the others with err. Apply signals started, and
+// waits for block, if they are set.
 type fakeManager struct {
-	err              error
-	upserts, deletes int
-	endpoints        []string
+	mu      sync.Mutex
+	batches [][]sdwan.Change
+	errs    map[string]error
+	err     error
+	started chan struct{}
+	block   chan struct{}
 }
 
 func (m *fakeManager) Apply(changes []sdwan.Change) []error {
+	if m.started != nil {
+		m.started <- struct{}{}
+	}
+	if m.block != nil {
+		<-m.block
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batches = append(m.batches, slices.Clone(changes))
 	errs := make([]error, len(changes))
 	for i, c := range changes {
-		if c.Delete {
-			m.deletes++
+		if err, ok := m.errs[c.Name]; ok {
+			errs[i] = err
 		} else {
-			m.upserts++
-			m.endpoints = c.Endpoints
+			errs[i] = m.err
 		}
-		errs[i] = m.err
 	}
 	return errs
 }
 
-// fakeClient serves a single object, or fails with err.
+func (m *fakeManager) applied() [][]sdwan.Change {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.batches)
+}
+
+func (m *fakeManager) setErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.err = err
+}
+
+// fakeClient serves tunnel policies by name, or fails with err.
 type fakeClient struct {
 	client.Client
-	obj *unstructured.Unstructured
-	err error
+	mu   sync.Mutex
+	objs map[string]*unstructured.Unstructured
+	err  error
+}
+
+func newFakeClient(objs ...*unstructured.Unstructured) *fakeClient {
+	c := &fakeClient{objs: map[string]*unstructured.Unstructured{}}
+	for _, obj := range objs {
+		c.set(obj)
+	}
+	return c
+}
+
+func (c *fakeClient) set(obj *unstructured.Unstructured) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.objs[obj.GetName()] = obj
 }
 
 func (c *fakeClient) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.err != nil {
 		return c.err
 	}
-	if c.obj == nil {
+	found, ok := c.objs[key.Name]
+	if !ok {
 		return apierrors.NewNotFound(schema.GroupResource{Resource: "tunnelpolicyviews"}, key.Name)
 	}
 	u := obj.(*unstructured.Unstructured)
 	gvk := u.GroupVersionKind()
-	u.Object = c.obj.DeepCopy().Object
+	u.Object = found.DeepCopy().Object
 	u.SetGroupVersionKind(gvk)
 	return nil
 }
 
-func tunnelPolicy(spec map[string]any) *unstructured.Unstructured {
+func tunnelPolicy(name string, spec map[string]any) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
-	obj.SetName("app-TCP-80")
+	obj.SetName(name)
 	obj.SetNamespace("default")
 	return obj
 }
@@ -85,57 +131,242 @@ func validSpec() map[string]any {
 	}
 }
 
-func request(event object.DeltaType) dreconciler.Request {
-	return dreconciler.Request{Namespace: "default", Name: "app-TCP-80", EventType: event,
-		GVK: schema.GroupVersionKind{Kind: "TunnelPolicyView"}}
+func request(name string, event object.DeltaType) dreconciler.Request {
+	return dreconciler.Request{Namespace: "default", Name: name, EventType: event,
+		GVK: schema.GroupVersionKind{Kind: tunnelPolicyKind}}
+}
+
+func key(name string) types.NamespacedName {
+	return types.NamespacedName{Namespace: "default", Name: name}
+}
+
+// newTestController returns a controller that retries after a millisecond and
+// does not wait for more changes before a batch.
+func newTestController(t *testing.T, c *fakeClient, m *fakeManager) *policyController {
+	t.Helper()
+	r := &policyController{
+		Client:       c,
+		log:          logr.Discard(),
+		sdwanManager: m,
+		queue:        newChangeQueue(time.Millisecond, time.Millisecond),
+	}
+	t.Cleanup(r.queue.ShutDown)
+	return r
+}
+
+// Every event was applied on its own, with a cycle of the central policy each,
+// and the events of one object were applied one by one, in turn with the
+// events of every other object.
+func TestReconcileQueuesObjectsOnce(t *testing.T) {
+	t.Parallel()
+	r := newTestController(t, newFakeClient(), &fakeManager{})
+	for _, event := range []object.DeltaType{object.Added, object.Updated, object.Upserted, object.Deleted} {
+		if _, err := r.Reconcile(context.Background(), request("app", event)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.Reconcile(context.Background(), request("other", object.Added)); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.queue.Len(); n != 2 {
+		t.Fatalf("%d objects queued, want 2", n)
+	}
+}
+
+// A batch applies the current state of each queued object: an upsert if it
+// exists, a delete if it is gone.
+func TestApplyBatchAppliesCurrentState(t *testing.T) {
+	t.Parallel()
+	// without endpoint pooling the pipeline emits a single address
+	single := validSpec()
+	delete(single, "addresses")
+	single["address"] = "10.0.0.9"
+	m := &fakeManager{}
+	r := newTestController(t, newFakeClient(tunnelPolicy("app-1", validSpec()), tunnelPolicy("app-2", single)), m)
+	for _, name := range []string{"app-1", "app-2", "gone"} {
+		r.queue.Add(key(name))
+	}
+
+	if !r.applyBatch(context.Background()) {
+		t.Fatal("applyBatch stopped")
+	}
+	want := []sdwan.Change{
+		{Namespace: "default", Name: "app-1", Endpoints: []string{"10.0.0.1"}, TargetPort: 8080, Protocol: "TCP", Tunnel: "biz-internet"},
+		{Namespace: "default", Name: "app-2", Endpoints: []string{"10.0.0.9"}, TargetPort: 8080, Protocol: "TCP", Tunnel: "biz-internet"},
+		{Namespace: "default", Name: "gone", Delete: true},
+	}
+	if got := m.applied(); len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+		t.Fatalf("applied %#v, want one batch %#v", got, want)
+	}
+	if n := r.queue.Len(); n != 0 {
+		t.Fatalf("%d objects left in the queue", n)
+	}
+}
+
+// A delete retried after the object was created again removed the new
+// object's list and sequences. The current state of the object is applied
+// instead, whatever the event was.
+func TestRecreatedObjectIsUpserted(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{}
+	r := newTestController(t, newFakeClient(tunnelPolicy("app", validSpec())), m)
+	if _, err := r.Reconcile(context.Background(), request("app", object.Deleted)); err != nil {
+		t.Fatal(err)
+	}
+
+	r.applyBatch(context.Background())
+	if got := m.applied(); len(got) != 1 || len(got[0]) != 1 || got[0][0].Delete {
+		t.Fatalf("applied %#v, want an upsert", got)
+	}
+}
+
+func TestApplyBatchIsCapped(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{}
+	r := newTestController(t, newFakeClient(), m)
+	for i := range maxBatch + 3 {
+		r.queue.Add(key(fmt.Sprintf("app-%d", i)))
+	}
+
+	r.applyBatch(context.Background())
+	r.applyBatch(context.Background())
+	if got := m.applied(); len(got) != 2 || len(got[0]) != maxBatch || len(got[1]) != 3 {
+		t.Fatalf("applied batches of %d changes, want %d and 3", len(got[0]), maxBatch)
+	}
 }
 
 // Errors from vManage were logged and Reconcile returned nil, so a failed
 // change was never retried.
-func TestReconcileRetries(t *testing.T) {
+func TestApplyBatchRetries(t *testing.T) {
 	t.Parallel()
 	transient := errors.New("vManage unreachable")
-	gone := apierrors.NewNotFound(schema.GroupResource{Resource: "tunnelpolicyviews"}, "app-TCP-80")
 	for _, tc := range []struct {
-		name     string
-		event    object.DeltaType
-		spec     map[string]any
-		getErr   error
-		mgrErr   error
-		retry    bool // a non-terminal error
-		terminal bool
+		name    string
+		spec    map[string]any // nil: the object is gone
+		getErr  error
+		mgrErr  error
+		applied bool
+		retry   bool
 	}{
-		{"upsert ok", object.Added, validSpec(), nil, nil, false, false},
-		{"upsert fails", object.Upserted, validSpec(), nil, transient, true, false},
-		{"upsert with invalid tunnel", object.Updated, validSpec(), nil, sdwan.ErrInvalidSpec, false, true},
-		{"spec without protocol", object.Added, map[string]any{"targetPort": int64(8080), "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, true},
-		{"named port", object.Added, map[string]any{"targetPort": "http", "protocol": "TCP", "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, true},
-		{"object gone", object.Upserted, nil, gone, nil, false, false},
-		{"get fails", object.Added, nil, transient, nil, true, false},
-		{"delete ok", object.Deleted, nil, gone, nil, false, false},
-		{"delete fails", object.Deleted, nil, gone, transient, true, false},
-		{"delete cannot check the object", object.Deleted, nil, transient, nil, true, false},
+		{"upsert ok", validSpec(), nil, nil, true, false},
+		{"upsert fails", validSpec(), nil, transient, true, true},
+		{"upsert with invalid tunnel", validSpec(), nil, sdwan.ErrInvalidSpec, true, false},
+		{"spec without protocol", map[string]any{"targetPort": int64(8080), "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, false},
+		{"named port", map[string]any{"targetPort": "http", "protocol": "TCP", "tunnel": "mpls", "addresses": []any{}}, nil, nil, false, false},
+		{"get fails", validSpec(), transient, nil, false, true},
+		{"delete ok", nil, nil, nil, true, false},
+		{"delete fails", nil, nil, transient, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			m := &fakeManager{err: tc.mgrErr}
-			r := &policyController{
-				Client:       &fakeClient{obj: tunnelPolicy(tc.spec), err: tc.getErr},
-				log:          logr.Discard(),
-				sdwanManager: m,
+			c := newFakeClient()
+			if tc.spec != nil {
+				c.set(tunnelPolicy("app", tc.spec))
 			}
+			c.err = tc.getErr
+			m := &fakeManager{err: tc.mgrErr}
+			r := newTestController(t, c, m)
+			r.queue.Add(key("app"))
 
-			_, err := r.Reconcile(context.Background(), request(tc.event))
-			terminal := errors.Is(err, reconcile.TerminalError(nil))
-			switch {
-			case tc.retry && (err == nil || terminal):
-				t.Fatalf("expected an error to retry, got %v", err)
-			case tc.terminal && !terminal:
-				t.Fatalf("expected a terminal error, got %v", err)
-			case !tc.retry && !tc.terminal && err != nil:
-				t.Fatalf("expected no error, got %v", err)
+			r.applyBatch(context.Background())
+			if applied := len(m.applied()) == 1; applied != tc.applied {
+				t.Fatalf("applied: %v, want %v", applied, tc.applied)
+			}
+			if retry := r.queue.NumRequeues(key("app")) == 1; retry != tc.retry {
+				t.Fatalf("retried: %v, want %v", retry, tc.retry)
 			}
 		})
+	}
+}
+
+// A change that keeps failing was retried forever, and every attempt
+// deactivated and activated the central policy.
+func TestApplyBatchGivesUpEventually(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{err: errors.New("vManage refuses")}
+	r := newTestController(t, newFakeClient(tunnelPolicy("app", validSpec())), m)
+	r.queue.Add(key("app"))
+
+	for range maxAttempts {
+		r.applyBatch(context.Background())
+	}
+	time.Sleep(20 * time.Millisecond) // a retry would be queued by now
+	if n, attempts := r.queue.Len(), len(m.applied()); n != 0 || attempts != maxAttempts {
+		t.Fatalf("%d attempts and %d queued after giving up, want %d and 0", attempts, n, maxAttempts)
+	}
+
+	// the count starts over after a success
+	r.queue.Add(key("app"))
+	r.applyBatch(context.Background())
+	m.setErr(nil)
+	r.applyBatch(context.Background())
+	if n := r.queue.NumRequeues(key("app")); n != 0 {
+		t.Fatalf("%d retries counted after a success", n)
+	}
+}
+
+// An object that changes while its batch is applied is applied again after,
+// once, with its newest state.
+func TestChangeDuringBatchIsAppliedOnceAfter(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{started: make(chan struct{}, 4), block: make(chan struct{})}
+	c := newFakeClient(tunnelPolicy("app", validSpec()))
+	r := newTestController(t, c, m)
+	r.queue.Add(key("app"))
+
+	done := make(chan struct{})
+	go func() {
+		r.applyBatch(context.Background())
+		close(done)
+	}()
+	<-m.started
+	newer := validSpec()
+	newer["addresses"] = []any{"10.0.0.2"}
+	c.set(tunnelPolicy("app", newer))
+	for range 2 {
+		if _, err := r.Reconcile(context.Background(), request("app", object.Updated)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(m.block)
+	<-done
+
+	r.applyBatch(context.Background())
+	got := m.applied()
+	if len(got) != 2 || len(got[1]) != 1 || !reflect.DeepEqual(got[1][0].Endpoints, []string{"10.0.0.2"}) {
+		t.Fatalf("applied %#v, want the newest state once after the first batch", got)
+	}
+	if n := r.queue.Len(); n != 0 {
+		t.Fatalf("%d objects left in the queue", n)
+	}
+}
+
+// A batch collected when the operator stops is not applied: the shutdown
+// would have to wait for its cycle.
+func TestRunBatchesStopsOnShutdown(t *testing.T) {
+	t.Parallel()
+	m := &fakeManager{}
+	r := newTestController(t, newFakeClient(), m)
+	r.batchDelay = time.Minute
+	r.queue.Add(key("app"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.runBatches(ctx) }()
+	for r.queue.Len() > 0 { // the batch is being collected
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runBatches does not return after shutdown")
+	}
+	if got := m.applied(); len(got) != 0 {
+		t.Fatalf("applied %#v after shutdown", got)
 	}
 }
 
@@ -212,7 +443,8 @@ func TestRunReturnsOnShutdown(t *testing.T) {
 // shutdown waits for the change in progress, and no new change starts.
 func TestRunWaitsForChangeInProgress(t *testing.T) {
 	t.Parallel()
-	r := &policyController{log: logr.Discard(), sdwanManager: &fakeManager{}}
+	m := &fakeManager{}
+	r := newTestController(t, newFakeClient(), m)
 	r.changing.RLock() // a change in progress
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runAsync(ctx, r, time.Minute)
@@ -233,15 +465,11 @@ func TestRunWaitsForChangeInProgress(t *testing.T) {
 		t.Fatal("run does not return after the change finished")
 	}
 
-	started := make(chan struct{})
-	go func() {
-		_, _ = r.Reconcile(context.Background(), request(object.Deleted))
-		close(started)
-	}()
-	select {
-	case <-started:
-		t.Fatal("a change started after shutdown")
-	case <-time.After(100 * time.Millisecond):
+	r.queue.Add(key("app"))
+	go r.applyBatch(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	if got := m.applied(); len(got) != 0 {
+		t.Fatalf("a change started after shutdown: %#v", got)
 	}
 }
 
@@ -320,66 +548,6 @@ func TestCheckFlags(t *testing.T) {
 	} {
 		if err := checkFlags(tc.dryRun, tc.noPooling); (err == nil) != tc.ok {
 			t.Fatalf("checkFlags(dryRun=%v, disableEndpointPooling=%v) = %v", tc.dryRun, tc.noPooling, err)
-		}
-	}
-}
-
-// Without endpoint pooling the pipeline emits a single address, which the
-// reconciler did not read.
-func TestReconcileReadsSingleAddress(t *testing.T) {
-	t.Parallel()
-	spec := validSpec()
-	delete(spec, "addresses")
-	spec["address"] = "10.0.0.1"
-	m := &fakeManager{}
-	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(spec)}, log: logr.Discard(), sdwanManager: m}
-
-	if _, err := r.Reconcile(context.Background(), request(object.Added)); err != nil {
-		t.Fatal(err)
-	}
-	if m.upserts != 1 || len(m.endpoints) != 1 || m.endpoints[0] != "10.0.0.1" {
-		t.Fatalf("upserted %d times with %v, want once with [10.0.0.1]", m.upserts, m.endpoints)
-	}
-}
-
-// A failed delete is retried with backoff. If the object was created again by
-// then, the retry removed the new object's list and sequences.
-func TestRetriedDeleteSparesRecreatedObject(t *testing.T) {
-	t.Parallel()
-	m := &fakeManager{}
-	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(validSpec())}, log: logr.Discard(), sdwanManager: m}
-
-	if _, err := r.Reconcile(context.Background(), request(object.Deleted)); err != nil {
-		t.Fatal(err)
-	}
-	if m.deletes != 0 {
-		t.Fatalf("delete of a recreated object removed its SD-WAN resources")
-	}
-}
-
-// A change that keeps failing was retried forever, and every attempt
-// deactivated and activated the central policy.
-func TestReconcileGivesUpEventually(t *testing.T) {
-	t.Parallel()
-	m := &fakeManager{err: errors.New("vManage refuses")}
-	r := &policyController{Client: &fakeClient{obj: tunnelPolicy(validSpec())}, log: logr.Discard(), sdwanManager: m}
-
-	for i := 1; i <= maxAttempts; i++ {
-		_, err := r.Reconcile(context.Background(), request(object.Added))
-		if terminal := errors.Is(err, reconcile.TerminalError(nil)); err == nil || terminal != (i == maxAttempts) {
-			t.Fatalf("attempt %d: got %v", i, err)
-		}
-	}
-
-	// the count starts over, and a success resets it
-	m.err = nil
-	if _, err := r.Reconcile(context.Background(), request(object.Added)); err != nil {
-		t.Fatal(err)
-	}
-	m.err = errors.New("vManage refuses")
-	for i := 1; i < maxAttempts; i++ {
-		if _, err := r.Reconcile(context.Background(), request(object.Added)); errors.Is(err, reconcile.TerminalError(nil)) {
-			t.Fatalf("attempt %d after a success is terminal: %v", i, err)
 		}
 	}
 }
