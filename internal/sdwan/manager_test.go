@@ -588,23 +588,28 @@ func TestListsOfSimilarNamesStayApart(t *testing.T) {
 }
 
 // A change that failed after the central policy was deactivated returned
-// without activating it again, leaving the network-wide policy off.
+// without activating it again, leaving the network-wide policy off. A change
+// that fails before the deactivate, or after the activate, must not toggle it
+// again.
 func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name, fail string
+		existing   bool
 		delete     bool
+		inWindow   bool
 	}{
-		{"upsert, dataprefix list", "POST /template/policy/list/dataprefix/", false},
-		{"upsert, approute", "PUT /template/policy/definition/approute/", false},
-		{"delete, approute", "PUT /template/policy/definition/approute/", true},
-		{"delete, dataprefix list", "DELETE /template/policy/list/dataprefix/", true},
+		{"upsert, new dataprefix list", "POST /template/policy/list/dataprefix/", false, false, false},
+		{"upsert, existing dataprefix list", "PUT /template/policy/list/dataprefix/", true, false, true},
+		{"upsert, approute", "PUT /template/policy/definition/approute/", false, false, true},
+		{"delete, approute", "PUT /template/policy/definition/approute/", true, true, true},
+		{"delete, dataprefix list", "DELETE /template/policy/list/dataprefix/", true, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f, ts := newFakeVManage(t)
 			m := newTestManager(t, ts.URL)
-			if tc.delete {
+			if tc.existing {
 				if err := upsert(m); err != nil {
 					t.Fatal(err)
 				}
@@ -625,9 +630,14 @@ func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
 			}
 			_, calls := f.state()
 			calls = calls[len(before):]
-			failed := slices.IndexFunc(calls, func(c string) bool { return strings.HasPrefix(c, tc.fail) })
-			if failed < 0 || !slices.Contains(calls[failed:], "POST /template/policy/vsmart/activate/cp-1") {
-				t.Fatalf("central policy not activated after the failed change; calls: %q", calls)
+			failed := callIndex(calls, tc.fail)
+			deactivate := callIndex(calls, "POST /template/policy/vsmart/deactivate/")
+			activate := callIndex(calls, "POST /template/policy/vsmart/activate/")
+			if failed < 0 || (deactivate < failed && failed < activate) != tc.inWindow {
+				t.Fatalf("%q failed at %d, deactivate at %d, activate at %d; calls: %q", tc.fail, failed, deactivate, activate, calls)
+			}
+			if countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1") != countCalls(calls, "POST /template/policy/vsmart/activate/cp-1") {
+				t.Fatalf("central policy left deactivated; calls: %q", calls)
 			}
 		})
 	}
@@ -1094,6 +1104,80 @@ func TestApplyBatchFailsTogether(t *testing.T) {
 	}
 	if _, calls := f.state(); !slices.Contains(calls, "POST /template/policy/vsmart/activate/cp-1") {
 		t.Fatalf("central policy not activated after the failed batch; calls: %q", calls)
+	}
+}
+
+// callIndex returns the index of the first call starting with prefix, or -1.
+func callIndex(calls []string, prefix string) int {
+	return slices.IndexFunc(calls, func(c string) bool { return strings.HasPrefix(c, prefix) })
+}
+
+// The edges route annotated traffic without a policy between the deactivate
+// and the activate: only the calls that need the policy off may happen in
+// between. A new list is not used yet, and a removed one no longer is.
+func TestApplyKeepsListCallsOutOfWindow(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-old", "10.0.0.1"), appChange("app-gone", "10.0.0.2")}))
+	lists := f.lists()
+	oldID, goneID := lists["default___app-old"], lists["default___app-gone"]
+	_, before := f.state()
+
+	checkNoErrors(t, m.Apply([]Change{
+		appChange("app-old", "10.0.1.1"),
+		appChange("app-new", "10.0.1.2"),
+		{Namespace: "default", Name: "app-gone", Delete: true},
+	}))
+	_, calls := f.state()
+	calls = calls[len(before):]
+	deactivate := callIndex(calls, "POST /template/policy/vsmart/deactivate/")
+	activate := callIndex(calls, "POST /template/policy/vsmart/activate/")
+	for _, tc := range []struct {
+		call     string
+		inWindow bool
+	}{
+		{"POST /template/policy/list/dataprefix/", false},
+		{"PUT /template/policy/list/dataprefix/" + oldID, true},
+		{"PUT /template/policy/definition/approute/", true},
+		{"DELETE /template/policy/list/dataprefix/" + goneID, false},
+	} {
+		i := callIndex(calls, tc.call)
+		if i < 0 || (deactivate < i && i < activate) != tc.inWindow {
+			t.Fatalf("%q called at %d, deactivate at %d, activate at %d; calls: %q", tc.call, i, deactivate, activate, calls)
+		}
+	}
+}
+
+// A list that cannot be deleted after its sequences are gone no longer routes:
+// only its change fails, and the retry deletes it without a cycle.
+func TestFailedListDeleteFailsOnlyItsChange(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")}))
+	id := f.lists()["default___app-1"]
+	f.mu.Lock()
+	f.fail = "DELETE /template/policy/list/dataprefix/" + id
+	f.mu.Unlock()
+
+	errs := m.Apply([]Change{{Namespace: "default", Name: "app-1", Delete: true}, appChange("app-2", "10.0.1.2")})
+	if errs[0] == nil || errs[1] != nil {
+		t.Fatalf("errors %v, want only the delete to fail", errs)
+	}
+	if f.usesList(id) {
+		t.Fatalf("sequences of the deleted service left: %s", f.approuteDefinition())
+	}
+
+	f.mu.Lock()
+	f.fail = ""
+	f.mu.Unlock()
+	_, before := f.state()
+	checkNoErrors(t, m.Apply([]Change{{Namespace: "default", Name: "app-1", Delete: true}}))
+	_, calls := f.state()
+	calls = calls[len(before):]
+	if callIndex(calls, "POST /template/policy/vsmart/") >= 0 || !slices.Contains(calls, "DELETE /template/policy/list/dataprefix/"+id) {
+		t.Fatalf("retried delete toggled the central policy or kept the list; calls: %q", calls)
 	}
 }
 

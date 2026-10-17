@@ -165,6 +165,8 @@ type update struct {
 	// listID and legacyID are the ids of the object's list and of its list
 	// from before names were hashed, "" if it has none.
 	listID, legacyID string
+	// created tells if the list was created for this change.
+	created bool
 }
 
 func (u *update) delete() bool { return u.listData == "" }
@@ -248,47 +250,71 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 		return errs
 	}
 
-	err := m.applyChange(fmt.Sprintf("%d change(s)", len(changed)), func() error {
-		// dataprefix
-		for _, u := range changed {
-			if u.delete() {
-				continue
-			}
-			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
-				return err
-			}
-			u.listID = m.objectCache["dataprefix"][u.objName]
+	// No sequence uses a new list yet: create it before the central policy
+	// is deactivated, to keep the time without a policy short.
+	for _, u := range changed {
+		if u.delete() || u.listID != "" {
+			continue
 		}
+		if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+			return fail(err, changed)
+		}
+		u.listID = m.objectCache["dataprefix"][u.objName]
+		u.created = true
+	}
 
-		// approute
-		if err := m.updateApproute(approuteID, changed); err != nil {
-			return err
-		}
-
-		for _, u := range changed {
-			if u.delete() && u.listID != "" {
-				if err := m.deleteDataPrefixList(u.listID); err != nil {
-					return err
-				}
-			}
-			if u.legacyID == "" {
-				continue
-			}
-			// The list from before names were hashed is unused now. If
-			// vManage keeps it (e.g. another policy uses it), it routes
-			// nothing for us, so failing, and retrying, an upsert would not
-			// help.
-			if err := m.deleteDataPrefixList(u.legacyID); err != nil {
-				if u.delete() {
-					return err
-				}
-				m.log.Error(err, "cannot delete legacy dataprefix list, leaving it", "id", u.legacyID)
-			}
-		}
-		return nil
-	})
+	endpoint := "/template/policy/definition/approute/" + approuteID
+	def, err := m.approuteDefinition(endpoint)
 	if err != nil {
 		return fail(err, changed)
+	}
+	newDef, modified, err := replaceSequences(def, changed)
+	if err != nil {
+		return fail(err, changed)
+	}
+
+	// Deletes whose lists no sequence uses, e.g. retries of deletes that
+	// failed after the sequences were removed, need no cycle.
+	if modified {
+		err := m.applyChange(fmt.Sprintf("%d change(s)", len(changed)), func() error {
+			for _, u := range changed {
+				if u.delete() || u.created {
+					continue
+				}
+				if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
+					return err
+				}
+			}
+			return m.putApproute(endpoint, newDef)
+		})
+		if err != nil {
+			return fail(err, changed)
+		}
+	}
+
+	// No sequence uses the removed lists now: delete them while the central
+	// policy is active. A failure fails only its change, whose retry needs no
+	// cycle.
+	for _, u := range changed {
+		if u.delete() && u.listID != "" {
+			if err := m.deleteDataPrefixList(u.listID); err != nil {
+				errs[u.idx] = err
+				continue
+			}
+		}
+		if u.legacyID == "" {
+			continue
+		}
+		// The list from before names were hashed is unused now. If vManage
+		// keeps it (e.g. another policy uses it), it routes nothing for us,
+		// so failing, and retrying, an upsert would not help.
+		if err := m.deleteDataPrefixList(u.legacyID); err != nil {
+			if u.delete() {
+				errs[u.idx] = err
+				continue
+			}
+			m.log.Error(err, "cannot delete legacy dataprefix list, leaving it", "id", u.legacyID)
+		}
 	}
 
 	return errs
@@ -358,66 +384,9 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 	return nil
 }
 
-// updateApproute replaces the approute sequences of the updates: it removes
-// those of their lists and legacy lists, and adds those of the upserts.
-func (m *sdwanManager) updateApproute(id string, updates []*update) error {
-	// get approute without existing seq rules matching on the lists
-	endpoint := "/template/policy/definition/approute/" + id
-	var stale []string
-	for _, u := range updates {
-		for _, l := range []string{u.listID, u.legacyID} {
-			if l != "" {
-				stale = append(stale, l)
-			}
-		}
-	}
-	desc, err := m.filterSequenceRules(endpoint, stale...)
-	if err != nil {
-		return err
-	}
-
-	// get sequence ID
-	s := gjson.Get(desc, "sequences.#.sequenceId")
-	sids := make([]int64, 0, len(s.Array()))
-	for _, v := range s.Array() {
-		sids = append(sids, v.Int())
-	}
-	sid := 1
-	if len(sids) > 0 {
-		sid = int(slices.Max(sids) + 1)
-	}
-
-	// install new seqrules
-	data := desc
-	for _, u := range updates {
-		if u.delete() {
-			continue
-		}
-		for _, direction := range []string{"source", "destination"} {
-			rule, err := generateSeqRule(sid, direction, u.listID, u.port, u.proto, u.tunnel)
-			if err != nil {
-				return err
-			}
-			if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
-				return err
-			}
-			sid++
-		}
-	}
-
-	res, err := m.client.Put(endpoint, data)
-	if err != nil {
-		m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
-		return err
-	}
-	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
-
-	return nil
-}
-
-// filterSequenceRules returns the approute definition at endpoint without the
-// sequences that match on any of the dataprefix lists.
-func (m *sdwanManager) filterSequenceRules(endpoint string, dataprefixIds ...string) (string, error) {
+// approuteDefinition returns the approute definition at endpoint, with a
+// sequences array.
+func (m *sdwanManager) approuteDefinition(endpoint string) (string, error) {
 	desc, err := m.client.Get(endpoint)
 	if err != nil {
 		return "", err
@@ -432,14 +401,71 @@ func (m *sdwanManager) filterSequenceRules(endpoint string, dataprefixIds ...str
 			return "", err
 		}
 	}
-	for _, dpid := range dataprefixIds {
+	return data, nil
+}
+
+// replaceSequences returns the approute definition def with the sequences of
+// the updates replaced: those of their lists and legacy lists removed, and
+// those of the upserts added. It also tells if the definition changed.
+func replaceSequences(def string, updates []*update) (string, bool, error) {
+	var stale []string
+	for _, u := range updates {
+		for _, l := range []string{u.listID, u.legacyID} {
+			if l != "" {
+				stale = append(stale, l)
+			}
+		}
+	}
+	data := def
+	for _, dpid := range stale {
 		s := gjson.Get(data, "sequences.#(match.entries.0.ref!=\""+dpid+"\")#")
+		var err error
 		if data, err = sjson.SetRaw(data, "sequences", s.String()); err != nil {
-			return "", err
+			return "", false, err
+		}
+	}
+	modified := len(gjson.Get(data, "sequences").Array()) < len(gjson.Get(def, "sequences").Array())
+
+	// get sequence ID
+	s := gjson.Get(data, "sequences.#.sequenceId")
+	sids := make([]int64, 0, len(s.Array()))
+	for _, v := range s.Array() {
+		sids = append(sids, v.Int())
+	}
+	sid := 1
+	if len(sids) > 0 {
+		sid = int(slices.Max(sids) + 1)
+	}
+
+	// install new seqrules
+	for _, u := range updates {
+		if u.delete() {
+			continue
+		}
+		for _, direction := range []string{"source", "destination"} {
+			rule, err := generateSeqRule(sid, direction, u.listID, u.port, u.proto, u.tunnel)
+			if err != nil {
+				return "", false, err
+			}
+			if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
+				return "", false, err
+			}
+			sid++
+			modified = true
 		}
 	}
 
-	return data, nil
+	return data, modified, nil
+}
+
+func (m *sdwanManager) putApproute(endpoint, data string) error {
+	res, err := m.client.Put(endpoint, data)
+	if err != nil {
+		m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
+		return err
+	}
+	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
+	return nil
 }
 
 type matchEntry struct {
