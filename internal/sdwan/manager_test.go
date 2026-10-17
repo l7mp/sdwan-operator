@@ -59,6 +59,10 @@ type fakeVManage struct {
 	// are truncated to maxListNameLen, as vManage does.
 	dataPrefixLists map[string]string
 	nextList        int
+	// listEntries holds the entries of the dataprefix lists by id, which
+	// the list of lists includes unless noEntries is set.
+	listEntries map[string]string
+	noEntries   bool
 	// approute is the approute definition, as last PUT.
 	approute string
 	// calls lists "METHOD path" of the API calls made with a valid session.
@@ -73,6 +77,7 @@ func newFakeVManage(t *testing.T) (*fakeVManage, *httptest.Server) {
 		sessions:        map[string]bool{},
 		vsmartPolicies:  `[{"policyName":"` + CentralizedPolicyName + `","policyId":"cp-1"}]`,
 		dataPrefixLists: map[string]string{},
+		listEntries:     map[string]string{},
 		approute:        `{"definitionId":"ar-1","name":"SDWANOperatorApproutePolicy","type":"appRoute","sequences":[],"defaultAction":{"type":"slaClass"}}`,
 	}
 	ts := httptest.NewTLSServer(http.HandlerFunc(f.serve))
@@ -164,9 +169,13 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/template/policy/vsmart":
 		_, _ = fmt.Fprint(w, `{"data":`+f.vsmartPolicies+`}`)
 	case r.Method == http.MethodGet && path == "/template/policy/list/dataprefix":
-		lists := []map[string]string{}
+		lists := []map[string]any{}
 		for name, id := range f.dataPrefixLists {
-			lists = append(lists, map[string]string{"name": name, "listId": id})
+			l := map[string]any{"name": name, "listId": id}
+			if entries, ok := f.listEntries[id]; ok && !f.noEntries {
+				l["entries"] = json.RawMessage(entries)
+			}
+			lists = append(lists, l)
 		}
 		data, _ := json.Marshal(lists)
 		_, _ = fmt.Fprintf(w, `{"data":%s}`, data)
@@ -192,6 +201,7 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		f.nextList++
 		id := fmt.Sprintf("dp-%d", f.nextList)
 		f.dataPrefixLists[name] = id
+		f.listEntries[id] = gjson.GetBytes(body, "entries").Raw
 		_, _ = fmt.Fprintf(w, `{"listId":%q}`, id)
 	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && strings.HasPrefix(path, "/template/policy/list/dataprefix/"):
 		id := strings.TrimPrefix(path, "/template/policy/list/dataprefix/")
@@ -206,6 +216,9 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			delete(f.dataPrefixLists, name)
+			delete(f.listEntries, id)
+		} else {
+			f.listEntries[id] = gjson.GetBytes(body, "entries").Raw
 		}
 		_, _ = fmt.Fprint(w, `{}`)
 	case strings.HasPrefix(path, "/template/policy/definition/approute/"):
@@ -333,6 +346,12 @@ func upsert(m *sdwanManager) error {
 	return upsertOne(m, "default", "llamacpp-backends", []string{"10.10.1.159", "10.10.0.22"}, 50052, "TCP", "biz-internet")
 }
 
+// upsertChanged changes the endpoints and the port of the service of upsert,
+// so that both its list and its sequences change.
+func upsertChanged(m *sdwanManager) error {
+	return upsertOne(m, "default", "llamacpp-backends", []string{"10.10.1.160"}, 50053, "TCP", "biz-internet")
+}
+
 // An expired vManage session made the operator hang in waitTasksFinish
 // (runningTasks read as "" instead of "[]") after a deactivate that silently
 // did nothing. The manager must log in again and apply the change.
@@ -347,7 +366,7 @@ func TestUpsertAfterSessionExpiry(t *testing.T) {
 	f.expire()
 
 	done := make(chan error, 1)
-	go func() { done <- upsert(m) }()
+	go func() { done <- upsertChanged(m) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -637,7 +656,7 @@ func TestFailedChangeActivatesCentralPolicyAgain(t *testing.T) {
 			if tc.delete {
 				err = deleteOne(m, "default", "llamacpp-backends")
 			} else {
-				err = upsert(m)
+				err = upsertChanged(m)
 			}
 			if err == nil || !strings.Contains(err.Error(), "StatusCode 500") {
 				t.Fatalf("expected the failed call's error, got %v", err)
@@ -1292,6 +1311,88 @@ func TestRejected(t *testing.T) {
 	} {
 		if got := rejected(tc.err); got != tc.want {
 			t.Errorf("rejected(%q) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// Every upsert rewrote the sequences and toggled the central policy, even when
+// nothing changed, e.g. for a resync or a retry queued before a newer change
+// succeeded.
+func TestUnchangedPolicyNeedsNoCycle(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                        string
+		endpoints                   []string
+		port                        int64
+		noEntries                   bool
+		cycle, listPut, approutePut bool
+	}{
+		{"unchanged", []string{"10.0.0.1", "10.0.0.2"}, 8080, false, false, false, false},
+		{"endpoints in another order", []string{"10.0.0.2", "10.0.0.1"}, 8080, false, false, false, false},
+		{"endpoints", []string{"10.0.0.1", "10.0.0.3"}, 8080, false, true, true, false},
+		{"port", []string{"10.0.0.1", "10.0.0.2"}, 9090, false, true, false, true},
+		// without the entries in the list of lists, the list may differ
+		{"unchanged, entries not listed", []string{"10.0.0.1", "10.0.0.2"}, 8080, true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f, ts := newFakeVManage(t)
+			m := newTestManager(t, ts.URL)
+			if err := upsertOne(m, "default", "app", []string{"10.0.0.1", "10.0.0.2"}, 8080, "TCP", "biz-internet"); err != nil {
+				t.Fatal(err)
+			}
+			f.mu.Lock()
+			f.noEntries = tc.noEntries
+			f.mu.Unlock()
+			_, before := f.state()
+
+			if err := upsertOne(m, "default", "app", tc.endpoints, tc.port, "TCP", "biz-internet"); err != nil {
+				t.Fatal(err)
+			}
+			_, calls := f.state()
+			calls = calls[len(before):]
+			id := f.lists()["default___app"]
+			cycle := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1") == 1 &&
+				countCalls(calls, "POST /template/policy/vsmart/activate/cp-1") == 1
+			listPut := slices.Contains(calls, "PUT /template/policy/list/dataprefix/"+id)
+			approutePut := slices.Contains(calls, "PUT /template/policy/definition/approute/ar-1")
+			if cycle != tc.cycle || listPut != tc.listPut || approutePut != tc.approutePut {
+				t.Fatalf("cycle %v, list PUT %v, approute PUT %v; want %v, %v, %v; calls: %q",
+					cycle, listPut, approutePut, tc.cycle, tc.listPut, tc.approutePut, calls)
+			}
+			if n := len(gjson.Get(f.approuteDefinition(), "sequences").Array()); n != 2 || !f.usesList(id) {
+				t.Fatalf("sequences wrong after the upsert: %s", f.approuteDefinition())
+			}
+		})
+	}
+}
+
+func TestSameSequences(t *testing.T) {
+	t.Parallel()
+	rule := func(id int, tunnel string) string {
+		r, err := generateSeqRule(id, "source", "dp-1", "8080", "6", tunnel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	dst, err := generateSeqRule(2, "destination", "dp-1", "8080", "6", "mpls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"none", nil, nil, true},
+		{"other ids and order", []string{rule(1, "mpls"), dst}, []string{dst, rule(7, "mpls")}, true},
+		{"other tunnel", []string{rule(1, "mpls")}, []string{rule(1, "biz-internet")}, false},
+		{"one more", []string{rule(1, "mpls")}, []string{rule(1, "mpls"), dst}, false},
+		{"unparsable", []string{`{"sequenceId":"x"}`}, []string{`{"sequenceId":"x"}`}, false},
+	} {
+		if got := sameSequences(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: sameSequences = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

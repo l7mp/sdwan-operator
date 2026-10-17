@@ -134,7 +134,10 @@ func (m *nullManager) Apply(changes []Change) []error {
 type sdwanManager struct {
 	client      sdwan.Client
 	objectCache map[string]map[string]string
-	log         logr.Logger
+	// listPrefixes holds the sorted prefixes of the dataprefix lists by id,
+	// for the lists vManage lists with their entries.
+	listPrefixes map[string][]string
+	log          logr.Logger
 	// taskWaitTimeout bounds waitTasksFinish; taskPollInterval is its poll period.
 	taskWaitTimeout  time.Duration
 	taskPollInterval time.Duration
@@ -147,6 +150,7 @@ type sdwanManager struct {
 // session) is errInvalidResponse.
 func (m *sdwanManager) refreshCache() error {
 	cache := make(map[string]map[string]string)
+	prefixes := make(map[string][]string)
 	for _, l := range []struct{ kind, endpoint, nameField, idField string }{
 		{"central", "/template/policy/vsmart", "policyName", "policyId"},
 		{"dataprefix", "/template/policy/list/dataprefix", "name", "listId"},
@@ -163,9 +167,18 @@ func (m *sdwanManager) refreshCache() error {
 		cache[l.kind] = make(map[string]string)
 		for _, val := range data.Array() {
 			cache[l.kind][val.Get(l.nameField).String()] = val.Get(l.idField).String()
+			if entries := val.Get("entries"); l.kind == "dataprefix" && entries.IsArray() {
+				var p []string
+				for _, e := range entries.Array() {
+					p = append(p, e.Get("ipPrefix").String())
+				}
+				slices.Sort(p)
+				prefixes[val.Get(l.idField).String()] = p
+			}
 		}
 	}
 	m.objectCache = cache
+	m.listPrefixes = prefixes
 
 	// refreshed for every change: log the full cache only when asked to
 	m.log.Info("object cache refreshed", "vsmart", len(cache["central"]),
@@ -181,17 +194,24 @@ type update struct {
 	idx             int
 	namespace, name string
 	objName         string
-	// listData is the dataprefix list to upsert, "" to delete the list.
+	// listData is the dataprefix list to upsert, "" to delete the list, and
+	// prefixes are its sorted prefixes.
 	listData            string
+	prefixes            []string
 	port, proto, tunnel string
 	// listID and legacyID are the ids of the object's list and of its list
 	// from before names were hashed, "" if it has none.
 	listID, legacyID string
-	// created tells if the change creates the object's list.
-	created bool
+	// created tells if the change creates the object's list, and
+	// listUnchanged if the existing list already has the prefixes.
+	created, listUnchanged bool
 }
 
 func (u *update) delete() bool { return u.listData == "" }
+
+// updatesList tells if the change updates a list that exists, and may be in
+// use.
+func (u *update) updatesList() bool { return !u.delete() && !u.created && !u.listUnchanged }
 
 // prepare checks a change and returns the update that makes it.
 func (m *sdwanManager) prepare(c Change) (*update, error) {
@@ -216,6 +236,10 @@ func (m *sdwanManager) prepare(c Change) (*update, error) {
 	if u.listData, err = m.generateDataPrefixList(u.objName, ipv4); err != nil {
 		return nil, err
 	}
+	for _, ip := range ipv4 {
+		u.prefixes = append(u.prefixes, ip+"/32")
+	}
+	slices.Sort(u.prefixes)
 	u.port = strconv.Itoa(int(c.TargetPort))
 	u.proto = strconv.Itoa(int(protoNum))
 	u.tunnel = c.Tunnel
@@ -263,6 +287,9 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 		u.listID = m.objectCache["dataprefix"][u.objName]
 		u.legacyID = m.legacyListID(u.namespace, u.name)
 		u.created = !u.delete() && u.listID == ""
+		if old, ok := m.listPrefixes[u.listID]; ok && !u.delete() && !u.created {
+			u.listUnchanged = slices.Equal(old, u.prefixes)
+		}
 		if u.delete() && u.listID == "" && u.legacyID == "" {
 			m.log.Info("no dataprefix list to delete", "name", u.objName)
 			continue
@@ -293,9 +320,10 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 		return fail(err, changed)
 	}
 
-	// Deletes whose lists no sequence uses, e.g. retries of deletes that
-	// failed after the sequences were removed, need no cycle.
-	if modified {
+	// A batch that changes neither a list in use nor the approute
+	// definition needs no cycle: e.g. a policy applied again unchanged, or the
+	// retry of a delete that failed after its sequences were removed.
+	if modified || slices.ContainsFunc(changed, (*update).updatesList) {
 		err := m.applyChange(fmt.Sprintf("%d change(s)", len(changed)), func() error {
 			// A change whose list vManage rejects keeps its old list and
 			// sequences: new sequences over the old list would pair a new
@@ -306,9 +334,12 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 			}
 			if len(kept) < len(changed) {
 				changed = kept
-				if newDef, modified, err = replaceSequences(def, changed); err != nil || !modified {
+				if newDef, modified, err = replaceSequences(def, changed); err != nil {
 					return err
 				}
+			}
+			if !modified {
+				return nil
 			}
 			return m.putApproute(endpoint, newDef)
 		})
@@ -352,7 +383,7 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 func (m *sdwanManager) upsertLists(updates []*update, created bool, errs []error) ([]*update, error) {
 	var kept []*update
 	for _, u := range updates {
-		if !u.delete() && u.created == created {
+		if (created && u.created) || (!created && u.updatesList()) {
 			if err := m.upsertDataPrefixList(u.objName, u.listData); err != nil {
 				if !rejected(err) {
 					return updates, err
@@ -453,7 +484,8 @@ func (m *sdwanManager) approuteDefinition(endpoint string) (string, error) {
 
 // replaceSequences returns the approute definition def with the sequences of
 // the updates replaced: those of their lists and legacy lists removed, and
-// those of the upserts added. It also tells if the definition changed.
+// those of the upserts added. It also tells if the definition changed: if the
+// sequences are already as wanted, it returns def.
 func replaceSequences(def string, updates []*update) (string, bool, error) {
 	var stale []string
 	for _, u := range updates {
@@ -464,14 +496,17 @@ func replaceSequences(def string, updates []*update) (string, bool, error) {
 		}
 	}
 	data := def
+	var removed, added []string
 	for _, dpid := range stale {
+		for _, seq := range gjson.Get(data, "sequences.#(match.entries.0.ref==\""+dpid+"\")#").Array() {
+			removed = append(removed, seq.Raw)
+		}
 		s := gjson.Get(data, "sequences.#(match.entries.0.ref!=\""+dpid+"\")#")
 		var err error
 		if data, err = sjson.SetRaw(data, "sequences", s.String()); err != nil {
 			return "", false, err
 		}
 	}
-	modified := len(gjson.Get(data, "sequences").Array()) < len(gjson.Get(def, "sequences").Array())
 
 	// get sequence ID
 	s := gjson.Get(data, "sequences.#.sequenceId")
@@ -497,12 +532,42 @@ func replaceSequences(def string, updates []*update) (string, bool, error) {
 			if data, err = sjson.SetRaw(data, "sequences.-1", rule); err != nil {
 				return "", false, err
 			}
+			added = append(added, rule)
 			sid++
-			modified = true
 		}
 	}
 
-	return data, modified, nil
+	if sameSequences(removed, added) {
+		return def, false, nil
+	}
+	return data, true, nil
+}
+
+// sameSequences tells if two sets of approute sequences differ at most in
+// their ids and order. A sequence that does not parse differs.
+func sameSequences(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	normalize := func(raws []string) []string {
+		out := make([]string, 0, len(raws))
+		for _, raw := range raws {
+			var r seqRule
+			if err := json.Unmarshal([]byte(raw), &r); err != nil {
+				return nil
+			}
+			r.SequenceID = 0
+			b, err := json.Marshal(r)
+			if err != nil {
+				return nil
+			}
+			out = append(out, string(b))
+		}
+		slices.Sort(out)
+		return out
+	}
+	na, nb := normalize(a), normalize(b)
+	return na != nil && nb != nil && slices.Equal(na, nb)
 }
 
 func (m *sdwanManager) putApproute(endpoint, data string) error {
