@@ -83,9 +83,10 @@ type Change struct {
 }
 
 type Manager interface {
-	// Apply makes the changes in one deactivate/activate cycle of the
-	// central policy, at most one change per object. It returns the error of
-	// each change, in order: nil for a change that was made.
+	// Apply makes the changes in one update of the central policy (a
+	// deactivate/activate cycle, or an in-place edit and push), at most one
+	// change per object. It returns the error of each change, in order: nil
+	// for a change that was made.
 	Apply(changes []Change) []error
 }
 
@@ -106,6 +107,11 @@ func NewManager(c Config, log logr.Logger) (Manager, error) {
 		log:              log,
 		taskWaitTimeout:  defaultTaskWaitTimeout,
 		taskPollInterval: defaultTaskPollInterval,
+		inPlace:          c.InPlaceUpdate,
+	}
+
+	if m.inPlace {
+		log.Info("in-place policy updates: changes edit the active central policy and push it")
 	}
 
 	//populate SDWAN cache
@@ -141,6 +147,9 @@ type sdwanManager struct {
 	// taskWaitTimeout bounds waitTasksFinish; taskPollInterval is its poll period.
 	taskWaitTimeout  time.Duration
 	taskPollInterval time.Duration
+	// inPlace edits the objects of the active central policy and pushes the
+	// edit, instead of deactivating the policy for the change.
+	inPlace bool
 }
 
 // refreshCache reloads the IDs of the vManage objects the operator uses, so
@@ -419,10 +428,22 @@ func (m *sdwanManager) deleteDataPrefixList(id string) error {
 	return nil
 }
 
-// applyChange makes a change while the central policy is deactivated. The
-// policy is activated again even if the change fails, so that a failed change
-// cannot leave the network-wide policy off.
+// applyChange makes a change to the objects of the central policy. With
+// in-place updates the policy stays active: the objects are edited and the
+// edit is pushed to the vSmarts, so the edges never run without the policy.
+// Otherwise the change is made while the policy is deactivated. Either way
+// the policy is activated (pushed) even if the change fails, so that a failed
+// change can neither leave the network-wide policy off nor leave edits in
+// vManage that the vSmarts do not have.
 func (m *sdwanManager) applyChange(op string, change func() error) error {
+	if m.inPlace {
+		err := change()
+		if perr := m.pushCentralPolicy(); perr != nil {
+			return errors.Join(err, perr)
+		}
+		return err
+	}
+
 	if err := m.deactivateCentralPolicy(); err != nil {
 		m.log.Error(err, "cannot deactivate central policy, continuing", "op", op)
 	}
@@ -693,6 +714,19 @@ func (m *sdwanManager) activateCentralPolicy() error {
 	return m.waitTasksFinish()
 }
 
+// pushCentralPolicy pushes the edited objects of the active central policy
+// to the vSmarts: vManage's activate call for an edited policy.
+func (m *sdwanManager) pushCentralPolicy() error {
+	id, ok := m.objectCache["central"][CentralizedPolicyName]
+	if !ok {
+		return errors.New("fail to get centralized policy name")
+	}
+	if err := m.postPolicyTask("/template/policy/vsmart/activate/"+id+"?confirm=true", `{"isEdited":true}`); err != nil {
+		return err
+	}
+	return m.waitTasksFinish()
+}
+
 func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
 	id, ok := m.objectCache["central"][CentralizedPolicyName]
 	if !ok {
@@ -704,11 +738,15 @@ func (m *sdwanManager) toggleCentralPolicy(activate bool) error {
 		baseUrl = "/template/policy/vsmart/deactivate/"
 	}
 
-	endpoint := baseUrl + id
 	var data string
 	if activate {
 		data = "{}"
 	}
+	return m.postPolicyTask(baseUrl+id, data)
+}
+
+// postPolicyTask makes a policy call that starts a vManage task.
+func (m *sdwanManager) postPolicyTask(endpoint, data string) error {
 	res, err := m.client.Post(endpoint, data)
 	if err != nil {
 		return err

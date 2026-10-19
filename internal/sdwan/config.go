@@ -12,6 +12,10 @@ type Config struct {
 	URL      string `yaml:"url"`
 	Insecure bool   `yaml:"insecure"`
 	DryRun   bool   `yaml:"dry-run,omitempty"`
+	// InPlaceUpdate edits the objects of the active central policy and pushes
+	// the edit to the vSmarts, instead of deactivating the policy for every
+	// change.
+	InPlaceUpdate bool `yaml:"in-place-update,omitempty"`
 }
 
 // ReadConfig reads configuration from a yaml file

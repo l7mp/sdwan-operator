@@ -67,6 +67,9 @@ type fakeVManage struct {
 	approute string
 	// calls lists "METHOD path" of the API calls made with a valid session.
 	calls []string
+	// policyCalls lists "path?query body" of the activate and deactivate
+	// calls.
+	policyCalls []string
 }
 
 const loginPage = "<html><head><title>Cisco vManage</title></head><body>login</body></html>"
@@ -187,6 +190,7 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"data":[{"name":"SDWANOperatorApproutePolicy","definitionId":"ar-1"}]}`)
 	case strings.HasPrefix(path, "/template/policy/vsmart/activate/"),
 		strings.HasPrefix(path, "/template/policy/vsmart/deactivate/"):
+		f.policyCalls = append(f.policyCalls, path+"?"+r.URL.RawQuery+" "+string(body))
 		if f.noTaskID {
 			_, _ = fmt.Fprint(w, `{}`)
 			return
@@ -1405,4 +1409,110 @@ func countCalls(calls []string, want string) int {
 		}
 	}
 	return n
+}
+
+// newInPlaceManager returns a manager that edits the active central policy.
+func newInPlaceManager(t *testing.T, url string) *sdwanManager {
+	t.Helper()
+	m := newTestManager(t, url)
+	m.inPlace = true
+	return m
+}
+
+// With in-place updates the central policy is never deactivated: lists and the
+// approute definition are edited while it is active, and one activate call
+// for the edited policy pushes them, after all the edits.
+func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-old", "10.0.0.1"), appChange("app-gone", "10.0.0.2")}))
+	_, before := f.state()
+
+	checkNoErrors(t, m.Apply([]Change{
+		appChange("app-old", "10.0.1.1"),
+		appChange("app-new", "10.0.1.2"),
+		{Namespace: "default", Name: "app-gone", Delete: true},
+	}))
+	_, calls := f.state()
+	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/"); n != 0 {
+		t.Fatalf("%d deactivates with in-place updates; calls: %q", n, calls)
+	}
+	calls = calls[len(before):]
+	if n := countCalls(calls, "POST /template/policy/vsmart/activate/cp-1"); n != 1 {
+		t.Fatalf("%d pushes for a batch, want 1; calls: %q", n, calls)
+	}
+	push := callIndex(calls, "POST /template/policy/vsmart/activate/")
+	for _, call := range []string{"PUT /template/policy/list/dataprefix/", "PUT /template/policy/definition/approute/"} {
+		if i := callIndex(calls, call); i < 0 || i > push {
+			t.Fatalf("%q at %d, push at %d; calls: %q", call, i, push, calls)
+		}
+	}
+	// a removed list is deleted only once the pushed policy no longer uses it
+	if i := callIndex(calls, "DELETE /template/policy/list/dataprefix/"); i < push {
+		t.Fatalf("list deleted at %d, before the push at %d; calls: %q", i, push, calls)
+	}
+	f.mu.Lock()
+	last := f.policyCalls[len(f.policyCalls)-1]
+	f.mu.Unlock()
+	if want := `/template/policy/vsmart/activate/cp-1?confirm=true {"isEdited":true}`; last != want {
+		t.Fatalf("push %q, want %q", last, want)
+	}
+	if !strings.Contains(f.approuteDefinition(), `"ref":"`+f.lists()["default___app-new"]+`"`) {
+		t.Fatalf("approute without the new list: %s", f.approuteDefinition())
+	}
+}
+
+// The edits a failed change made are in vManage: they must be pushed, so that
+// vManage and the vSmarts do not disagree, and the change still fails.
+func TestInPlaceUpdatePushesAfterFailedChange(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	f.mu.Lock()
+	f.fail = "PUT /template/policy/definition/approute/"
+	f.mu.Unlock()
+	_, before := f.state()
+
+	// new endpoints and a new port: the list PUT succeeds, the approute PUT fails
+	c := appChange("app-1", "10.0.0.9")
+	c.TargetPort = 9090
+	if err := m.Apply([]Change{c})[0]; err == nil {
+		t.Fatal("change succeeded although the approute PUT failed")
+	}
+	_, calls := f.state()
+	calls = calls[len(before):]
+	if callIndex(calls, "PUT /template/policy/list/dataprefix/") < 0 ||
+		countCalls(calls, "POST /template/policy/vsmart/activate/cp-1") != 1 {
+		t.Fatalf("edited list not pushed after the failed change; calls: %q", calls)
+	}
+}
+
+// A failed push fails the batch, and is retried like any other failure.
+func TestInPlaceUpdateFailedPushFailsBatch(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	f.mu.Lock()
+	f.noTaskID = true
+	f.mu.Unlock()
+	errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
+	if errs[0] == nil || errs[1] == nil {
+		t.Fatalf("errors %v, want both changes to fail when the push starts no task", errs)
+	}
+}
+
+// A batch that changes nothing in use needs no push, as it needs no cycle.
+func TestInPlaceUpdateSkipsPushWithoutChanges(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	_, before := f.state()
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	_, calls := f.state()
+	if n := countCalls(calls[len(before):], "POST /template/policy/vsmart/"); n != 0 {
+		t.Fatalf("%d policy calls for an unchanged policy; calls: %q", n, calls[len(before):])
+	}
 }
