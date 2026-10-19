@@ -34,9 +34,11 @@ true` in the chart's values) the operator edits the
 objects of the active policy instead, so the policy is never off. vManage
 answers such an edit with an edit session (`processId`) and the device
 templates it affects (`masterTemplatesAffected`, the vSmarts' template); the
-operator pushes those templates with their device inputs marked as edited
-(`POST /template/device/config/attachfeature`), as vManage does for an edited
-policy definition, which applies the edit and ends the session. Without
+operator pushes those templates with their device inputs marked as edited, as
+vManage's UI does for an edited policy definition (`POST
+/template/device/config/attachcli` for a CLI template, as the vSmarts' usually
+is, `attachfeature` for a feature template), which applies the edit and ends
+the session. Without
 affected templates it reactivates the policy
 (`POST /template/policy/vsmart/activate/<id>?confirm=true` with
 `{"isEdited":true}`). If vManage reports the policy locked (`POLICY0013`), the
