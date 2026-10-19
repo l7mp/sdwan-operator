@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -785,11 +786,25 @@ func (m *sdwanManager) pushEdits() error {
 	return m.pushTemplates(templates)
 }
 
-// pushTemplates pushes device templates with their current device inputs
-// (attachfeature with isEdited), and waits for the push task.
+// pushTemplates pushes device templates with their current device inputs,
+// marked as edited, and waits for each push task: a CLI template (configType
+// "file", as the vSmarts' usually is) with attachcli, a feature template with
+// attachfeature, as vManage's UI does after an edit of a policy in use.
 func (m *sdwanManager) pushTemplates(templates []string) error {
-	list := []any{}
+	res, err := m.client.Get("/template/device?feature=all")
+	if err != nil {
+		return err
+	}
+	configType := map[string]string{}
+	for _, t := range res.Get("data").Array() {
+		configType[t.Get("templateId").String()] = t.Get("configType").String()
+	}
+	lists := map[string][]any{}
 	for _, tid := range templates {
+		ct, ok := configType[tid]
+		if !ok {
+			return fmt.Errorf("GET /template/device: no template %s: %w", tid, errInvalidResponse)
+		}
 		res, err := m.client.Get("/template/device/config/attached/" + tid)
 		if err != nil {
 			return err
@@ -805,7 +820,7 @@ func (m *sdwanManager) pushTemplates(templates []string) error {
 		if err != nil {
 			return err
 		}
-		res, err = m.client.Post("/template/device/config/input", string(body))
+		res, err = m.client.Post("/template/device/config/input/", string(body))
 		if err != nil {
 			return err
 		}
@@ -816,23 +831,31 @@ func (m *sdwanManager) pushTemplates(templates []string) error {
 		for _, in := range inputs {
 			in["csv-templateId"] = tid
 		}
-		list = append(list, map[string]any{"templateId": tid, "isEdited": true, "device": inputs})
+		endpoint := "/template/device/config/attachfeature"
+		if ct == "file" {
+			endpoint = "/template/device/config/attachcli"
+		}
+		lists[endpoint] = append(lists[endpoint], map[string]any{"templateId": tid, "device": inputs, "isEdited": true})
 	}
-	body, err := json.Marshal(map[string]any{"deviceTemplateList": list})
-	if err != nil {
-		return err
+	for _, endpoint := range slices.Sorted(maps.Keys(lists)) {
+		body, err := json.Marshal(map[string]any{"deviceTemplateList": lists[endpoint]})
+		if err != nil {
+			return err
+		}
+		res, err := m.client.Post(endpoint, string(body))
+		if err != nil {
+			return err
+		}
+		m.log.Info(fmt.Sprintf("POST %s: templates %v, result: %s", endpoint, templates, res))
+		id := res.Get("id").String()
+		if id == "" {
+			return fmt.Errorf("POST %s: %w", endpoint, errInvalidResponse)
+		}
+		if err := m.waitAction(id); err != nil {
+			return err
+		}
 	}
-	endpoint := "/template/device/config/attachfeature"
-	res, err := m.client.Post(endpoint, string(body))
-	if err != nil {
-		return err
-	}
-	m.log.Info(fmt.Sprintf("POST %s: templates %v, result: %s", endpoint, templates, res))
-	id := res.Get("id").String()
-	if id == "" {
-		return fmt.Errorf("POST %s: %w", endpoint, errInvalidResponse)
-	}
-	return m.waitAction(id)
+	return nil
 }
 
 // waitAction waits until the vManage action id is done, for at most
@@ -845,7 +868,11 @@ func (m *sdwanManager) waitAction(id string) error {
 		if err == nil && res.Get("summary.status").String() == "done" {
 			m.log.Info(fmt.Sprintf("GET %s: %s", endpoint, res.Get("summary")))
 			if n := res.Get("summary.count.Failure").Int(); n > 0 {
-				return fmt.Errorf("%s: failed on %d device(s): %s", endpoint, n, res.Get("summary"))
+				var why []string
+				for _, d := range res.Get("data").Array() {
+					why = append(why, d.Get("host-name").String()+": "+d.Get("currentActivity").String())
+				}
+				return fmt.Errorf("%s: failed on %d device(s): %s", endpoint, n, strings.Join(why, "; "))
 			}
 			return nil
 		}

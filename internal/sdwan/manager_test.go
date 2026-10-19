@@ -85,11 +85,16 @@ type fakeVManage struct {
 	nextLock    int
 	sticky      bool
 	noTemplates bool
-	snapshot    string
+	// featureTemplate makes tmpl-1 a feature template; by default it is a
+	// CLI template (configType "file"), as the testbed's vSmart template is,
+	// which the vSmart refuses to get through attachfeature.
+	featureTemplate bool
+	snapshot        string
 	// attachFails makes the template push fail on the vSmart; attaches
 	// lists the bodies of the attachfeature calls.
-	attachFails bool
-	attaches    []string
+	attachFails  bool
+	failedAttach bool
+	attaches     []string
 	// editResponse is the answer to the PUT being served, if it opened an
 	// edit session.
 	editResponse string
@@ -196,29 +201,44 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.Method == http.MethodGet && path == "/template/device" && r.URL.Query().Get("feature") == "all":
+		configType := "file"
+		if f.featureTemplate {
+			configType = "template"
+		}
+		_, _ = fmt.Fprintf(w, `{"data":[{"templateId":"tmpl-1","templateName":"vSmartManaged","configType":%q,"deviceType":"vsmart"}]}`, configType)
+		return
 	case r.Method == http.MethodGet && path == "/template/device/config/attached/tmpl-1":
 		_, _ = fmt.Fprint(w, `{"data":[{"uuid":"vsmart-1","deviceIP":"1.1.1.3"}]}`)
 		return
-	case r.Method == http.MethodPost && path == "/template/device/config/input":
+	case r.Method == http.MethodPost && path == "/template/device/config/input/":
 		if gjson.GetBytes(body, "templateId").String() != "tmpl-1" || !gjson.GetBytes(body, "isEdited").Bool() {
 			http.Error(w, "bad input request "+string(body), http.StatusBadRequest)
 			return
 		}
 		_, _ = fmt.Fprint(w, `{"header":{},"data":[{"csv-status":"complete","csv-deviceId":"vsmart-1","csv-deviceIP":"1.1.1.3"}]}`)
 		return
-	case r.Method == http.MethodPost && path == "/template/device/config/attachfeature":
-		f.attaches = append(f.attaches, string(body))
-		if gjson.GetBytes(body, "deviceTemplateList.0.templateId").String() == "tmpl-1" && !f.sticky {
+	case r.Method == http.MethodPost && (path == "/template/device/config/attachfeature" || path == "/template/device/config/attachcli"):
+		f.attaches = append(f.attaches, path+" "+string(body))
+		// the vSmart refuses a push of its CLI template as a feature template
+		// (access-denied), and vManage then rolls the edit back
+		if wrong := (path == "/template/device/config/attachcli") == f.featureTemplate; wrong {
+			f.failedAttach = true
+			if f.lock != "" {
+				f.lock, f.approute = "", f.snapshot
+			}
+		} else if gjson.GetBytes(body, "deviceTemplateList.0.templateId").String() == "tmpl-1" && !f.sticky {
 			f.lock = ""
 		}
 		_, _ = fmt.Fprintf(w, `{"id":"push_feature_template_configuration-attach-%d"}`, len(f.attaches))
 		return
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/device/action/status/") && path != tasksEndpoint:
-		count := `{"Success":1}`
-		if f.attachFails {
-			count = `{"Failure":1}`
+		if f.attachFails || f.failedAttach {
+			f.failedAttach = false
+			_, _ = fmt.Fprint(w, `{"summary":{"status":"done","count":{"Failure":1}},"data":[{"host-name":"vsmart1","status":"Failure","currentActivity":"Device failed to process request.  Error type : application Error tag : access-denied"}]}`)
+			return
 		}
-		_, _ = fmt.Fprintf(w, `{"summary":{"status":"done","count":%s},"data":[]}`, count)
+		_, _ = fmt.Fprint(w, `{"summary":{"status":"done","count":{"Success":1}},"data":[{"host-name":"vsmart1","status":"Success"}]}`)
 		return
 	}
 	isList := r.Method == http.MethodGet && (path == "/template/policy/vsmart" ||
@@ -1529,10 +1549,10 @@ func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
 		t.Fatalf("%d deactivates with in-place updates; calls: %q", n, calls)
 	}
 	calls = calls[len(before):]
-	if n := countCalls(calls, "POST /template/device/config/attachfeature"); n != 1 {
+	if n := countCalls(calls, "POST /template/device/config/attachcli"); n != 1 {
 		t.Fatalf("%d template pushes for a batch, want 1; calls: %q", n, calls)
 	}
-	push := callIndex(calls, "POST /template/device/config/attachfeature")
+	push := callIndex(calls, "POST /template/device/config/attachcli")
 	for _, call := range []string{"PUT /template/policy/list/dataprefix/", "PUT /template/policy/definition/approute/"} {
 		if i := callIndex(calls, call); i < 0 || i > push {
 			t.Fatalf("%q at %d, push at %d; calls: %q", call, i, push, calls)
@@ -1546,7 +1566,7 @@ func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
 		t.Fatalf("edit session discarded; calls: %q", calls)
 	}
 	f.mu.Lock()
-	attach := f.attaches[len(f.attaches)-1]
+	attach := strings.SplitN(f.attaches[len(f.attaches)-1], " ", 2)[1]
 	f.mu.Unlock()
 	for _, path := range []string{"deviceTemplateList.0.templateId", "deviceTemplateList.0.device.0.csv-templateId"} {
 		if v := gjson.Get(attach, path).String(); v != "tmpl-1" {
@@ -1587,6 +1607,48 @@ func TestInPlaceUpdateFlipsInARow(t *testing.T) {
 	_, calls := f.state()
 	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"); n != 0 {
 		t.Fatalf("%d deactivates; calls: %q", n, calls)
+	}
+}
+
+// The testbed's vSmart template is a CLI template, which vManage's UI pushes
+// with attachcli; pushing it with attachfeature made the vSmart answer
+// access-denied, and vManage rolled the edit back. A feature template is
+// pushed with attachfeature.
+func TestInPlaceUpdatePushesTemplateByType(t *testing.T) {
+	t.Parallel()
+	for _, feature := range []bool{false, true} {
+		f, ts := newFakeVManage(t)
+		m := newInPlaceManager(t, ts.URL)
+		f.mu.Lock()
+		f.featureTemplate = feature
+		f.mu.Unlock()
+		checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+		c := appChange("app-1", "10.0.0.1")
+		c.Tunnel = "public-internet"
+		checkNoErrors(t, m.Apply([]Change{c}))
+		want := map[bool]string{false: "attachcli", true: "attachfeature"}[feature]
+		_, calls := f.state()
+		if n := countCalls(calls, "POST /template/device/config/"+want); n != 2 {
+			t.Fatalf("feature template %v: %d %s pushes, want 2; calls: %q", feature, n, want, calls)
+		}
+		if !strings.Contains(f.approuteDefinition(), `"parameter":"public-internet"`) {
+			t.Fatalf("feature template %v: edit not kept: %s", feature, f.approuteDefinition())
+		}
+	}
+}
+
+// A push the vSmart refuses fails the batch with its reason, and vManage's
+// rollback is not taken for success.
+func TestInPlaceUpdateReportsRefusedPush(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	f.mu.Lock()
+	f.attachFails = true
+	f.mu.Unlock()
+	err := m.Apply([]Change{appChange("app-1", "10.0.0.1")})[0]
+	if err == nil || !strings.Contains(err.Error(), "access-denied") {
+		t.Fatalf("error %v, want the vSmart's reason", err)
 	}
 }
 
@@ -1631,7 +1693,7 @@ func TestInPlaceUpdatePushesAfterFailedChange(t *testing.T) {
 	_, calls := f.state()
 	calls = calls[len(before):]
 	if callIndex(calls, "PUT /template/policy/list/dataprefix/") < 0 ||
-		countCalls(calls, "POST /template/device/config/attachfeature") != 1 {
+		countCalls(calls, "POST /template/device/config/attachcli") != 1 {
 		t.Fatalf("edited list not pushed after the failed change; calls: %q", calls)
 	}
 }
@@ -1661,7 +1723,7 @@ func TestInPlaceUpdateSkipsPushWithoutChanges(t *testing.T) {
 	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
 	_, calls := f.state()
 	calls = calls[len(before):]
-	if n := countCalls(calls, "POST /template/device/config/attachfeature"); n != 0 || callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
+	if callIndex(calls, "POST /template/device/config/attach") >= 0 || callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
 		t.Fatalf("push for an unchanged policy; calls: %q", calls)
 	}
 }
