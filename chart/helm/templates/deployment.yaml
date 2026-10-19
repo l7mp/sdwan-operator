@@ -26,6 +26,9 @@ spec:
         args:
           - "-config-file"
           - "/config/vmanage-config.yaml"
+          {{- if .Values.inPlaceUpdate }}
+          - "-in-place-update"
+          {{- end }}
         resources:
           limits:
             cpu: 500m

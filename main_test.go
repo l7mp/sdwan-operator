@@ -27,7 +27,7 @@ import (
 
 func TestMain(m *testing.M) {
 	off := false
-	dryRun, disableEndpointPooling = &off, &off
+	dryRun, disableEndpointPooling, inPlaceUpdate = &off, &off, &off
 	os.Exit(m.Run())
 }
 
@@ -549,6 +549,33 @@ func TestCheckFlags(t *testing.T) {
 		if err := checkFlags(tc.dryRun, tc.noPooling); (err == nil) != tc.ok {
 			t.Fatalf("checkFlags(dryRun=%v, disableEndpointPooling=%v) = %v", tc.dryRun, tc.noPooling, err)
 		}
+	}
+}
+
+// The -in-place-update flag enables in-place updates on top of the config
+// file, so that the mode can be switched without editing the credentials.
+func TestReadVManageConfigInPlaceFlag(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		file       string
+		flag, want bool
+	}{
+		{"url: https://vmanage\n", false, false},
+		{"url: https://vmanage\n", true, true},
+		{"url: https://vmanage\nin-place-update: true\n", false, true},
+	} {
+		path := dir + "/vmanage-config.yaml"
+		if err := os.WriteFile(path, []byte(tc.file), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := readVManageConfig(false, tc.flag, path)
+		if err != nil || c.InPlaceUpdate != tc.want {
+			t.Fatalf("file %q, flag %v: InPlaceUpdate %v (err %v), want %v", tc.file, tc.flag, c != nil && c.InPlaceUpdate, err, tc.want)
+		}
+	}
+	if c, err := readVManageConfig(true, true, dir+"/missing.yaml"); err != nil || !c.DryRun {
+		t.Fatalf("dry run: %+v, %v", c, err)
 	}
 }
 

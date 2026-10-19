@@ -29,7 +29,8 @@ vmanage:
 By default every change deactivates the operator's central policy, edits its
 lists and app-route definition, and activates it again; while it is
 deactivated (about 8 s per change), the edges route all annotated Services
-without the policy. With `in-place-update: true` the operator edits the
+without the policy. With `in-place-update: true` (or the `-in-place-update` flag, `inPlaceUpdate:
+true` in the chart's values) the operator edits the
 objects of the active policy and pushes the edit to the vSmarts instead
 (`POST /template/policy/vsmart/activate/<id>?confirm=true` with
 `{"isEdited":true}`), so the policy is never off. This mode is experimental:

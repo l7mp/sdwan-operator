@@ -64,10 +64,10 @@ const (
 )
 
 var (
-	scheme                         = runtime.NewScheme()
-	disableEndpointPooling, dryRun *bool
-	configFile                     *string
-	server                         *apiserver.APIServer
+	scheme                                        = runtime.NewScheme()
+	disableEndpointPooling, dryRun, inPlaceUpdate *bool
+	configFile                                    *string
+	server                                        *apiserver.APIServer
 )
 
 func init() {
@@ -110,14 +110,9 @@ func NewOperator(specFile string, logger logr.Logger) (*doperator.Operator, *pol
 		return nil, nil, fmt.Errorf("unable to create SDWAN operator: %w", err)
 	}
 
-	// Read vManage config
-	vManageConf := &sdwan.Config{DryRun: *dryRun}
-	if !*dryRun {
-		c, err := sdwan.ReadConfig(*configFile)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable to read vManage config: %w", err)
-		}
-		vManageConf = c
+	vManageConf, err := readVManageConfig(*dryRun, *inPlaceUpdate, *configFile)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Create the SD-WAN policy controller
@@ -435,10 +430,27 @@ func getTargetPort(spec map[string]interface{}) (int64, error) {
 	return port, nil
 }
 
+// readVManageConfig returns the vManage config: from the config file, unless
+// in a dry run, with in-place updates also enabled by the flag. The flag
+// switches the mode without editing the file, which holds the credentials.
+func readVManageConfig(dryRun, inPlace bool, path string) (*sdwan.Config, error) {
+	if dryRun {
+		return &sdwan.Config{DryRun: true}, nil
+	}
+	c, err := sdwan.ReadConfig(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read vManage config: %w", err)
+	}
+	c.InPlaceUpdate = c.InPlaceUpdate || inPlace
+	return c, nil
+}
+
 func main() {
 	disableEndpointPooling = flag.Bool("disable-endpoint-pooling", false,
 		"Generate per-endpoint objects instead of a single object listing all service endpoints (requires -dry-run).")
 	dryRun = flag.Bool("dry-run", false, "Suppress SD-WAN policy updates.")
+	inPlaceUpdate = flag.Bool("in-place-update", false,
+		"Edit the active central policy and push the edit, instead of deactivating it for every change (experimental; same as in-place-update in the config file).")
 
 	configFile = flag.String("config-file", SDWANConfigFile, "Config file path")
 

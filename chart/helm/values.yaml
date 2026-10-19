@@ -13,6 +13,10 @@ image:
   tag: latest
   pullPolicy: Always
 
+# Edit the active central policy and push the edit, instead of deactivating it
+# for every change (experimental, see the README).
+inPlaceUpdate: false
+
 
 vmanage:
   url: REPLACE_WITH_YOUR_URL
