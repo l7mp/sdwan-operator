@@ -33,7 +33,11 @@ without the policy. With `in-place-update: true` (or the `-in-place-update` flag
 true` in the chart's values) the operator edits the
 objects of the active policy and pushes the edit to the vSmarts instead
 (`POST /template/policy/vsmart/activate/<id>?confirm=true` with
-`{"isEdited":true}`), so the policy is never off. This mode is experimental:
+`{"isEdited":true}`), so the policy is never off. vManage opens an edit
+session for such an edit and keeps the policy locked after the push; the
+operator ends the session (`DELETE /template/lock/<processId>`), and if vManage
+still reports the policy locked (`POLICY0013`), it applies that change with a
+deactivate/activate cycle, which ends the session. This mode is experimental:
 check on your vManage version that the push takes effect before relying on it.
 
 ### Install from Helm repository
