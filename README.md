@@ -23,7 +23,17 @@ vmanage:
   username: admin
   password: <your-password>
   insecure: false
+  # in-place-update: true  # experimental, see below
 ```
+
+By default every change deactivates the operator's central policy, edits its
+lists and app-route definition, and activates it again; while it is
+deactivated (about 8 s per change), the edges route all annotated Services
+without the policy. With `in-place-update: true` the operator edits the
+objects of the active policy and pushes the edit to the vSmarts instead
+(`POST /template/policy/vsmart/activate/<id>?confirm=true` with
+`{"isEdited":true}`), so the policy is never off. This mode is experimental:
+check on your vManage version that the push takes effect before relying on it.
 
 ### Install from Helm repository
 
