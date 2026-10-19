@@ -31,13 +31,17 @@ lists and app-route definition, and activates it again; while it is
 deactivated (about 8 s per change), the edges route all annotated Services
 without the policy. With `in-place-update: true` (or the `-in-place-update` flag, `inPlaceUpdate:
 true` in the chart's values) the operator edits the
-objects of the active policy and pushes the edit to the vSmarts instead
+objects of the active policy instead, so the policy is never off. vManage
+answers such an edit with an edit session (`processId`) and the device
+templates it affects (`masterTemplatesAffected`, the vSmarts' template); the
+operator pushes those templates with their device inputs marked as edited
+(`POST /template/device/config/attachfeature`), as vManage does for an edited
+policy definition, which applies the edit and ends the session. Without
+affected templates it reactivates the policy
 (`POST /template/policy/vsmart/activate/<id>?confirm=true` with
-`{"isEdited":true}`), so the policy is never off. vManage opens an edit
-session for such an edit and keeps the policy locked after the push; the
-operator ends the session (`DELETE /template/lock/<processId>`), and if vManage
-still reports the policy locked (`POLICY0013`), it applies that change with a
-deactivate/activate cycle, which ends the session. This mode is experimental:
+`{"isEdited":true}`). If vManage reports the policy locked (`POLICY0013`), the
+operator applies that change with a deactivate/activate cycle, which ends the
+session. This mode is experimental:
 check on your vManage version that the push takes effect before relying on it.
 
 ### Install from Helm repository
