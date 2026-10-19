@@ -70,6 +70,21 @@ type fakeVManage struct {
 	// policyCalls lists "path?query body" of the activate and deactivate
 	// calls.
 	policyCalls []string
+	// inactive tells if the central policy is deactivated. A PUT while it
+	// is active opens an edit session (lock); further PUTs join it until the
+	// push (an activate), after which PUTs fail with POLICY0013 until a DELETE
+	// /template/lock/<lock> or a deactivate ends it, as the testbed's vManage
+	// 20.15 did. sticky makes only a deactivate end it, as on a vManage that
+	// wants another release call. That PUTs before the push join the session
+	// is assumed, not observed.
+	inactive bool
+	lock     string
+	pushed   bool
+	nextLock int
+	sticky   bool
+	// editResponse is the answer to the PUT being served, if it opened an
+	// edit session.
+	editResponse string
 }
 
 const loginPage = "<html><head><title>Cisco vManage</title></head><body>login</body></html>"
@@ -148,6 +163,26 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodPut && strings.HasPrefix(path, "/template/policy/") {
+		if f.lock != "" && f.pushed {
+			http.Error(w, `{"error":{"message":"Failed to acquire lock, template or policy locked in edit mode.","code":"POLICY0013","details":"Failed to acquire lock for template type policy_definition with policy idcp-1","type":"error"}}`, http.StatusBadRequest)
+			return
+		}
+		if !f.inactive {
+			if f.lock == "" {
+				f.nextLock++
+				f.lock, f.pushed = fmt.Sprintf("push_feature_template_configuration-%d", f.nextLock), false
+			}
+			f.editResponse = fmt.Sprintf(`{"processId":%q,"masterTemplatesAffected":["tmpl-1"]}`, f.lock)
+		}
+	}
+	if r.Method == http.MethodDelete && strings.HasPrefix(path, "/template/lock/") {
+		if id := strings.TrimPrefix(path, "/template/lock/"); id == f.lock && !f.sticky {
+			f.lock = ""
+		}
+		_, _ = fmt.Fprint(w, `{}`)
+		return
+	}
 	isList := r.Method == http.MethodGet && (path == "/template/policy/vsmart" ||
 		path == "/template/policy/list/dataprefix" || path == "/template/policy/definition/approute")
 	if f.listsBroken && isList {
@@ -191,6 +226,12 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/template/policy/vsmart/activate/"),
 		strings.HasPrefix(path, "/template/policy/vsmart/deactivate/"):
 		f.policyCalls = append(f.policyCalls, path+"?"+r.URL.RawQuery+" "+string(body))
+		f.inactive = strings.HasPrefix(path, "/template/policy/vsmart/deactivate/")
+		if f.inactive {
+			f.lock = ""
+		} else if f.lock != "" {
+			f.pushed = true
+		}
 		if f.noTaskID {
 			_, _ = fmt.Fprint(w, `{}`)
 			return
@@ -224,17 +265,27 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		} else {
 			f.listEntries[id] = gjson.GetBytes(body, "entries").Raw
 		}
-		_, _ = fmt.Fprint(w, `{}`)
+		f.answerEdit(w)
 	case strings.HasPrefix(path, "/template/policy/definition/approute/"):
 		if r.Method == http.MethodGet {
 			_, _ = fmt.Fprint(w, f.approute)
 			return
 		}
 		f.approute = string(body)
-		_, _ = fmt.Fprint(w, `{}`)
+		f.answerEdit(w)
 	default:
 		http.Error(w, "unexpected "+r.Method+" "+path, http.StatusNotFound)
 	}
+}
+
+// answerEdit answers a PUT: with the edit session it opened, if any.
+func (f *fakeVManage) answerEdit(w http.ResponseWriter) {
+	if f.editResponse != "" {
+		_, _ = fmt.Fprint(w, f.editResponse)
+		f.editResponse = ""
+		return
+	}
+	_, _ = fmt.Fprint(w, `{}`)
 }
 
 // vManageStoredName returns the name vManage 20.15 stores for a list: names
@@ -1514,5 +1565,69 @@ func TestInPlaceUpdateSkipsPushWithoutChanges(t *testing.T) {
 	_, calls := f.state()
 	if n := countCalls(calls[len(before):], "POST /template/policy/vsmart/"); n != 0 {
 		t.Fatalf("%d policy calls for an unchanged policy; calls: %q", n, calls[len(before):])
+	}
+}
+
+// vManage locks the policy in edit mode for an in-place PUT: the lock was
+// never released, so the second change failed with POLICY0013 forever. Every
+// edit session must be released after the push, and changes keep working.
+func TestInPlaceUpdateReleasesEditLock(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	for i, tunnel := range []string{"public-internet", "biz-internet", "public-internet"} {
+		c := appChange("app-1", "10.0.0.1")
+		c.Tunnel = tunnel
+		checkNoErrors(t, m.Apply([]Change{c}))
+		if !strings.Contains(f.approuteDefinition(), tunnel) {
+			t.Fatalf("change %d to %s not in the approute: %s", i, tunnel, f.approuteDefinition())
+		}
+	}
+	_, calls := f.state()
+	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"); n != 0 {
+		t.Fatalf("%d deactivates; calls: %q", n, calls)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lock != "" {
+		t.Fatalf("edit session %s left open", f.lock)
+	}
+	if want := "DELETE /template/lock/push_feature_template_configuration-3"; callIndex(calls, want) < 0 {
+		t.Fatalf("no %q; calls: %q", want, calls)
+	}
+}
+
+// If vManage keeps the policy locked after the release, the next change is
+// made with a deactivate/activate cycle, which ends the session, instead of
+// failing until it gives up.
+func TestInPlaceUpdateFallsBackToCycleWhenLocked(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	f.mu.Lock()
+	f.sticky = true
+	f.mu.Unlock()
+	// the first change's approute PUT opens a session the release cannot end
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	_, before := f.state()
+	c := appChange("app-1", "10.0.0.1")
+	c.Tunnel = "public-internet"
+	checkNoErrors(t, m.Apply([]Change{c})) // locked: falls back to a cycle
+	_, calls := f.state()
+	calls = calls[len(before):]
+	if countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1") != 1 || countCalls(calls, "POST /template/policy/vsmart/activate/cp-1") != 1 {
+		t.Fatalf("want one cycle for the locked policy; calls: %q", calls)
+	}
+	if !strings.Contains(f.approuteDefinition(), `"parameter":"public-internet"`) {
+		t.Fatalf("change not applied: %s", f.approuteDefinition())
+	}
+}
+
+func TestLockedIsNotRejected(t *testing.T) {
+	t.Parallel()
+	err := lockedErr(gjson.Parse(`{"error":{"code":"POLICY0013","details":"locked"}}`), errors.New("HTTP Request failed: StatusCode 400"))
+	if !errors.Is(err, errPolicyLocked) || rejected(err) {
+		t.Fatalf("locked error %v: errPolicyLocked %v, rejected %v", err, errors.Is(err, errPolicyLocked), rejected(err))
 	}
 }

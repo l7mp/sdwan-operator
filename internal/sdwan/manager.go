@@ -34,6 +34,14 @@ const (
 // reports as success with an empty body.
 var errInvalidResponse = errors.New("unexpected vManage response (session expired?)")
 
+// errPolicyLocked is returned when vManage refuses an edit because the
+// policy is locked in edit mode (POLICY0013). An in-place edit of an active
+// policy opens such a session; a deactivate ends it.
+var errPolicyLocked = errors.New("policy locked in edit mode")
+
+// policyLockedCode is vManage's error code for errPolicyLocked.
+const policyLockedCode = "POLICY0013"
+
 // statusRe matches the HTTP status in the errors of go-sdwan, which has no
 // error type for it.
 var statusRe = regexp.MustCompile(`HTTP Request failed: StatusCode (\d{3})`)
@@ -43,6 +51,9 @@ var statusRe = regexp.MustCompile(`HTTP Request failed: StatusCode (\d{3})`)
 // other error, like an expired session or a 5xx status, would fail the other
 // calls too.
 func rejected(err error) bool {
+	if errors.Is(err, errPolicyLocked) {
+		return false
+	}
 	m := statusRe.FindStringSubmatch(err.Error())
 	if m == nil {
 		return false
@@ -150,6 +161,9 @@ type sdwanManager struct {
 	// inPlace edits the objects of the active central policy and pushes the
 	// edit, instead of deactivating the policy for the change.
 	inPlace bool
+	// locks holds the edit sessions (processId) that in-place PUTs opened,
+	// to be released after the push.
+	locks []string
 }
 
 // refreshCache reloads the IDs of the vManage objects the operator uses, so
@@ -435,15 +449,32 @@ func (m *sdwanManager) deleteDataPrefixList(id string) error {
 // the policy is activated (pushed) even if the change fails, so that a failed
 // change can neither leave the network-wide policy off nor leave edits in
 // vManage that the vSmarts do not have.
+// An in-place edit opens an edit session in vManage that locks the policy:
+// it is released after the push, and if vManage still finds the policy
+// locked, the change is made with a cycle, which ends the session.
 func (m *sdwanManager) applyChange(op string, change func() error) error {
 	if m.inPlace {
 		err := change()
-		if perr := m.pushCentralPolicy(); perr != nil {
+		if errors.Is(err, errPolicyLocked) {
+			// An edit session vManage still holds: a deactivate ends it. The
+			// PUTs before the refused one are made again, unchanged.
+			m.log.Error(err, "central policy locked in edit mode, applying the change with a deactivate/activate cycle", "op", op)
+			m.releaseLocks()
+			return m.cycle(op, change)
+		}
+		perr := m.pushCentralPolicy()
+		m.releaseLocks()
+		if perr != nil {
 			return errors.Join(err, perr)
 		}
 		return err
 	}
+	return m.cycle(op, change)
+}
 
+// cycle makes a change while the central policy is deactivated, and activates
+// it again even if the change fails.
+func (m *sdwanManager) cycle(op string, change func() error) error {
 	if err := m.deactivateCentralPolicy(); err != nil {
 		m.log.Error(err, "cannot deactivate central policy, continuing", "op", op)
 	}
@@ -464,9 +495,10 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 		res, err := m.client.Put(putEndpoint, data)
 		if err != nil {
 			m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", putEndpoint, data, res))
-			return err
+			return lockedErr(res, err)
 		}
 		m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", putEndpoint, data, res))
+		m.recordLock(res)
 	} else {
 		res, err := m.client.Post(endpoint, data)
 		if err != nil {
@@ -595,10 +627,45 @@ func (m *sdwanManager) putApproute(endpoint, data string) error {
 	res, err := m.client.Put(endpoint, data)
 	if err != nil {
 		m.log.Error(err, fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
-		return err
+		return lockedErr(res, err)
 	}
 	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
+	m.recordLock(res)
 	return nil
+}
+
+// lockedErr returns errPolicyLocked, wrapping err, if vManage's response says
+// the policy is locked in edit mode, and err otherwise.
+func lockedErr(res gjson.Result, err error) error {
+	if res.Get("error.code").String() == policyLockedCode {
+		return fmt.Errorf("%w: %s: %w", errPolicyLocked, res.Get("error.details").String(), err)
+	}
+	return err
+}
+
+// recordLock keeps the edit session an in-place PUT opened: vManage answers
+// a PUT of an object an active policy uses with the processId of the session
+// (and the templates it affects), and holds the policy locked until it ends.
+func (m *sdwanManager) recordLock(res gjson.Result) {
+	if id := res.Get("processId").String(); m.inPlace && id != "" && !slices.Contains(m.locks, id) {
+		m.locks = append(m.locks, id)
+	}
+}
+
+// releaseLocks ends the edit sessions of the in-place PUTs. A failure is
+// logged only: the next edit then finds the policy locked, and applies its
+// change with a cycle, which ends the session.
+func (m *sdwanManager) releaseLocks() {
+	for _, id := range m.locks {
+		endpoint := "/template/lock/" + id
+		res, err := m.client.Delete(endpoint)
+		if err != nil {
+			m.log.Error(err, fmt.Sprintf("DELETE %s, result: %s", endpoint, res))
+			continue
+		}
+		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
+	}
+	m.locks = nil
 }
 
 type matchEntry struct {
