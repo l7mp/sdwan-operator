@@ -70,18 +70,26 @@ type fakeVManage struct {
 	// policyCalls lists "path?query body" of the activate and deactivate
 	// calls.
 	policyCalls []string
-	// inactive tells if the central policy is deactivated. A PUT while it
-	// is active opens an edit session (lock); further PUTs join it until the
-	// push (an activate), after which PUTs fail with POLICY0013 until a DELETE
-	// /template/lock/<lock> or a deactivate ends it, as the testbed's vManage
-	// 20.15 did. sticky makes only a deactivate end it, as on a vManage that
-	// wants another release call. That PUTs before the push join the session
-	// is assumed, not observed.
-	inactive bool
-	lock     string
-	pushed   bool
-	nextLock int
-	sticky   bool
+	// inactive tells if the central policy is deactivated. As the testbed's
+	// vManage 20.15 did: a PUT while it is active opens an edit session
+	// (lock) that affects the vSmart template tmpl-1; after a reactivate
+	// (activate with isEdited) PUTs fail with POLICY0013; DELETE
+	// /template/lock/<lock> discards the session and rolls the approute
+	// definition back to its state when the session opened; a deactivate ends
+	// the session. Assumed (python-viptela's flow, not observed): PUTs before
+	// the push join the session, and pushing tmpl-1 (attachfeature) commits
+	// it, unless sticky is set. noTemplates makes PUTs affect no template.
+	inactive    bool
+	lock        string
+	pushed      bool
+	nextLock    int
+	sticky      bool
+	noTemplates bool
+	snapshot    string
+	// attachFails makes the template push fail on the vSmart; attaches
+	// lists the bodies of the attachfeature calls.
+	attachFails bool
+	attaches    []string
 	// editResponse is the answer to the PUT being served, if it opened an
 	// edit session.
 	editResponse string
@@ -171,16 +179,46 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		if !f.inactive {
 			if f.lock == "" {
 				f.nextLock++
-				f.lock, f.pushed = fmt.Sprintf("push_feature_template_configuration-%d", f.nextLock), false
+				f.lock, f.pushed, f.snapshot = fmt.Sprintf("push_feature_template_configuration-%d", f.nextLock), false, f.approute
 			}
-			f.editResponse = fmt.Sprintf(`{"processId":%q,"masterTemplatesAffected":["tmpl-1"]}`, f.lock)
+			templates := `["tmpl-1"]`
+			if f.noTemplates {
+				templates = `[]`
+			}
+			f.editResponse = fmt.Sprintf(`{"processId":%q,"masterTemplatesAffected":%s}`, f.lock, templates)
 		}
 	}
 	if r.Method == http.MethodDelete && strings.HasPrefix(path, "/template/lock/") {
-		if id := strings.TrimPrefix(path, "/template/lock/"); id == f.lock && !f.sticky {
-			f.lock = ""
+		if id := strings.TrimPrefix(path, "/template/lock/"); id == f.lock {
+			f.lock, f.approute = "", f.snapshot
 		}
 		_, _ = fmt.Fprint(w, `{}`)
+		return
+	}
+	switch {
+	case r.Method == http.MethodGet && path == "/template/device/config/attached/tmpl-1":
+		_, _ = fmt.Fprint(w, `{"data":[{"uuid":"vsmart-1","deviceIP":"1.1.1.3"}]}`)
+		return
+	case r.Method == http.MethodPost && path == "/template/device/config/input":
+		if gjson.GetBytes(body, "templateId").String() != "tmpl-1" || !gjson.GetBytes(body, "isEdited").Bool() {
+			http.Error(w, "bad input request "+string(body), http.StatusBadRequest)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"header":{},"data":[{"csv-status":"complete","csv-deviceId":"vsmart-1","csv-deviceIP":"1.1.1.3"}]}`)
+		return
+	case r.Method == http.MethodPost && path == "/template/device/config/attachfeature":
+		f.attaches = append(f.attaches, string(body))
+		if gjson.GetBytes(body, "deviceTemplateList.0.templateId").String() == "tmpl-1" && !f.sticky {
+			f.lock = ""
+		}
+		_, _ = fmt.Fprintf(w, `{"id":"push_feature_template_configuration-attach-%d"}`, len(f.attaches))
+		return
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/device/action/status/") && path != tasksEndpoint:
+		count := `{"Success":1}`
+		if f.attachFails {
+			count = `{"Failure":1}`
+		}
+		_, _ = fmt.Fprintf(w, `{"summary":{"status":"done","count":%s},"data":[]}`, count)
 		return
 	}
 	isList := r.Method == http.MethodGet && (path == "/template/policy/vsmart" ||
@@ -1471,8 +1509,9 @@ func newInPlaceManager(t *testing.T, url string) *sdwanManager {
 }
 
 // With in-place updates the central policy is never deactivated: lists and the
-// approute definition are edited while it is active, and one activate call
-// for the edited policy pushes them, after all the edits.
+// approute definition are edited while it is active, and the vSmart template
+// they affect is pushed once, after all the edits, with the device inputs
+// marked as edited.
 func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
 	t.Parallel()
 	f, ts := newFakeVManage(t)
@@ -1486,14 +1525,14 @@ func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
 		{Namespace: "default", Name: "app-gone", Delete: true},
 	}))
 	_, calls := f.state()
-	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/"); n != 0 {
+	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"); n != 0 {
 		t.Fatalf("%d deactivates with in-place updates; calls: %q", n, calls)
 	}
 	calls = calls[len(before):]
-	if n := countCalls(calls, "POST /template/policy/vsmart/activate/cp-1"); n != 1 {
-		t.Fatalf("%d pushes for a batch, want 1; calls: %q", n, calls)
+	if n := countCalls(calls, "POST /template/device/config/attachfeature"); n != 1 {
+		t.Fatalf("%d template pushes for a batch, want 1; calls: %q", n, calls)
 	}
-	push := callIndex(calls, "POST /template/policy/vsmart/activate/")
+	push := callIndex(calls, "POST /template/device/config/attachfeature")
 	for _, call := range []string{"PUT /template/policy/list/dataprefix/", "PUT /template/policy/definition/approute/"} {
 		if i := callIndex(calls, call); i < 0 || i > push {
 			t.Fatalf("%q at %d, push at %d; calls: %q", call, i, push, calls)
@@ -1503,14 +1542,71 @@ func TestInPlaceUpdateNeverDeactivates(t *testing.T) {
 	if i := callIndex(calls, "DELETE /template/policy/list/dataprefix/"); i < push {
 		t.Fatalf("list deleted at %d, before the push at %d; calls: %q", i, push, calls)
 	}
+	if callIndex(calls, "DELETE /template/lock/") >= 0 {
+		t.Fatalf("edit session discarded; calls: %q", calls)
+	}
 	f.mu.Lock()
-	last := f.policyCalls[len(f.policyCalls)-1]
+	attach := f.attaches[len(f.attaches)-1]
 	f.mu.Unlock()
-	if want := `/template/policy/vsmart/activate/cp-1?confirm=true {"isEdited":true}`; last != want {
-		t.Fatalf("push %q, want %q", last, want)
+	for _, path := range []string{"deviceTemplateList.0.templateId", "deviceTemplateList.0.device.0.csv-templateId"} {
+		if v := gjson.Get(attach, path).String(); v != "tmpl-1" {
+			t.Fatalf("%s = %q in %s", path, v, attach)
+		}
+	}
+	if !gjson.Get(attach, "deviceTemplateList.0.isEdited").Bool() || gjson.Get(attach, "deviceTemplateList.0.device.0.csv-deviceId").String() != "vsmart-1" {
+		t.Fatalf("push without the edited device inputs: %s", attach)
 	}
 	if !strings.Contains(f.approuteDefinition(), `"ref":"`+f.lists()["default___app-new"]+`"`) {
 		t.Fatalf("approute without the new list: %s", f.approuteDefinition())
+	}
+}
+
+// The first in-place attempt reactivated the policy and then deleted the edit
+// session's lock, which rolled vManage's definition back: the next change was
+// built on the old definition. Flips in a row must each leave the new state in
+// vManage and end the session.
+func TestInPlaceUpdateFlipsInARow(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	for i, tunnel := range []string{"public-internet", "biz-internet", "public-internet", "biz-internet"} {
+		c := appChange("app-1", "10.0.0.1")
+		c.Tunnel = tunnel
+		checkNoErrors(t, m.Apply([]Change{c}))
+		if !strings.Contains(f.approuteDefinition(), `"parameter":"`+tunnel+`"`) {
+			t.Fatalf("flip %d to %s not in vManage's definition: %s", i, tunnel, f.approuteDefinition())
+		}
+		f.mu.Lock()
+		lock := f.lock
+		f.mu.Unlock()
+		if lock != "" {
+			t.Fatalf("flip %d left the edit session %s open", i, lock)
+		}
+	}
+	_, calls := f.state()
+	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"); n != 0 {
+		t.Fatalf("%d deactivates; calls: %q", n, calls)
+	}
+}
+
+// Without affected templates (a vSmart policy not pushed by a template) the
+// edit is applied by reactivating the policy.
+func TestInPlaceUpdateReactivatesWithoutTemplates(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newInPlaceManager(t, ts.URL)
+	f.mu.Lock()
+	f.noTemplates = true
+	f.mu.Unlock()
+	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.attaches) != 0 || len(f.policyCalls) == 0 {
+		t.Fatalf("attaches %q, policy calls %q", f.attaches, f.policyCalls)
+	}
+	if last := f.policyCalls[len(f.policyCalls)-1]; last != `/template/policy/vsmart/activate/cp-1?confirm=true {"isEdited":true}` {
+		t.Fatalf("push %q", last)
 	}
 }
 
@@ -1535,22 +1631,23 @@ func TestInPlaceUpdatePushesAfterFailedChange(t *testing.T) {
 	_, calls := f.state()
 	calls = calls[len(before):]
 	if callIndex(calls, "PUT /template/policy/list/dataprefix/") < 0 ||
-		countCalls(calls, "POST /template/policy/vsmart/activate/cp-1") != 1 {
+		countCalls(calls, "POST /template/device/config/attachfeature") != 1 {
 		t.Fatalf("edited list not pushed after the failed change; calls: %q", calls)
 	}
 }
 
-// A failed push fails the batch, and is retried like any other failure.
+// A push that fails on the vSmart fails the batch, and is retried like any
+// other failure.
 func TestInPlaceUpdateFailedPushFailsBatch(t *testing.T) {
 	t.Parallel()
 	f, ts := newFakeVManage(t)
 	m := newInPlaceManager(t, ts.URL)
 	f.mu.Lock()
-	f.noTaskID = true
+	f.attachFails = true
 	f.mu.Unlock()
 	errs := m.Apply([]Change{appChange("app-1", "10.0.0.1"), appChange("app-2", "10.0.0.2")})
 	if errs[0] == nil || errs[1] == nil {
-		t.Fatalf("errors %v, want both changes to fail when the push starts no task", errs)
+		t.Fatalf("errors %v, want both changes to fail when the push fails", errs)
 	}
 }
 
@@ -1563,44 +1660,15 @@ func TestInPlaceUpdateSkipsPushWithoutChanges(t *testing.T) {
 	_, before := f.state()
 	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
 	_, calls := f.state()
-	if n := countCalls(calls[len(before):], "POST /template/policy/vsmart/"); n != 0 {
-		t.Fatalf("%d policy calls for an unchanged policy; calls: %q", n, calls[len(before):])
+	calls = calls[len(before):]
+	if n := countCalls(calls, "POST /template/device/config/attachfeature"); n != 0 || callIndex(calls, "POST /template/policy/vsmart/") >= 0 {
+		t.Fatalf("push for an unchanged policy; calls: %q", calls)
 	}
 }
 
-// vManage locks the policy in edit mode for an in-place PUT: the lock was
-// never released, so the second change failed with POLICY0013 forever. Every
-// edit session must be released after the push, and changes keep working.
-func TestInPlaceUpdateReleasesEditLock(t *testing.T) {
-	t.Parallel()
-	f, ts := newFakeVManage(t)
-	m := newInPlaceManager(t, ts.URL)
-	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
-	for i, tunnel := range []string{"public-internet", "biz-internet", "public-internet"} {
-		c := appChange("app-1", "10.0.0.1")
-		c.Tunnel = tunnel
-		checkNoErrors(t, m.Apply([]Change{c}))
-		if !strings.Contains(f.approuteDefinition(), tunnel) {
-			t.Fatalf("change %d to %s not in the approute: %s", i, tunnel, f.approuteDefinition())
-		}
-	}
-	_, calls := f.state()
-	if n := countCalls(calls, "POST /template/policy/vsmart/deactivate/cp-1"); n != 0 {
-		t.Fatalf("%d deactivates; calls: %q", n, calls)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.lock != "" {
-		t.Fatalf("edit session %s left open", f.lock)
-	}
-	if want := "DELETE /template/lock/push_feature_template_configuration-3"; callIndex(calls, want) < 0 {
-		t.Fatalf("no %q; calls: %q", want, calls)
-	}
-}
-
-// If vManage keeps the policy locked after the release, the next change is
-// made with a deactivate/activate cycle, which ends the session, instead of
-// failing until it gives up.
+// If the push does not end the edit session, the next change is made with a
+// deactivate/activate cycle, which ends it, instead of failing until it gives
+// up.
 func TestInPlaceUpdateFallsBackToCycleWhenLocked(t *testing.T) {
 	t.Parallel()
 	f, ts := newFakeVManage(t)
@@ -1608,8 +1676,11 @@ func TestInPlaceUpdateFallsBackToCycleWhenLocked(t *testing.T) {
 	f.mu.Lock()
 	f.sticky = true
 	f.mu.Unlock()
-	// the first change's approute PUT opens a session the release cannot end
+	// the first change's approute PUT opens a session the push does not end
 	checkNoErrors(t, m.Apply([]Change{appChange("app-1", "10.0.0.1")}))
+	f.mu.Lock()
+	f.pushed = true // as after vManage's push: further PUTs are refused
+	f.mu.Unlock()
 	_, before := f.state()
 	c := appChange("app-1", "10.0.0.1")
 	c.Tunnel = "public-internet"

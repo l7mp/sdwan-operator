@@ -161,9 +161,9 @@ type sdwanManager struct {
 	// inPlace edits the objects of the active central policy and pushes the
 	// edit, instead of deactivating the policy for the change.
 	inPlace bool
-	// locks holds the edit sessions (processId) that in-place PUTs opened,
-	// to be released after the push.
-	locks []string
+	// templates holds the device templates (masterTemplatesAffected) that
+	// in-place PUTs left to push.
+	templates []string
 }
 
 // refreshCache reloads the IDs of the vManage objects the operator uses, so
@@ -449,8 +449,9 @@ func (m *sdwanManager) deleteDataPrefixList(id string) error {
 // the policy is activated (pushed) even if the change fails, so that a failed
 // change can neither leave the network-wide policy off nor leave edits in
 // vManage that the vSmarts do not have.
-// An in-place edit opens an edit session in vManage that locks the policy:
-// it is released after the push, and if vManage still finds the policy
+// An in-place edit opens an edit session in vManage that locks the policy
+// until the device templates it affects (the vSmarts') are pushed; deleting
+// the session's lock instead discards the edit. If vManage finds the policy
 // locked, the change is made with a cycle, which ends the session.
 func (m *sdwanManager) applyChange(op string, change func() error) error {
 	if m.inPlace {
@@ -459,11 +460,10 @@ func (m *sdwanManager) applyChange(op string, change func() error) error {
 			// An edit session vManage still holds: a deactivate ends it. The
 			// PUTs before the refused one are made again, unchanged.
 			m.log.Error(err, "central policy locked in edit mode, applying the change with a deactivate/activate cycle", "op", op)
-			m.releaseLocks()
+			m.templates = nil
 			return m.cycle(op, change)
 		}
-		perr := m.pushCentralPolicy()
-		m.releaseLocks()
+		perr := m.pushEdits()
 		if perr != nil {
 			return errors.Join(err, perr)
 		}
@@ -498,7 +498,7 @@ func (m *sdwanManager) upsertDataPrefixList(objName, data string) error {
 			return lockedErr(res, err)
 		}
 		m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", putEndpoint, data, res))
-		m.recordLock(res)
+		m.recordEdit(res)
 	} else {
 		res, err := m.client.Post(endpoint, data)
 		if err != nil {
@@ -630,7 +630,7 @@ func (m *sdwanManager) putApproute(endpoint, data string) error {
 		return lockedErr(res, err)
 	}
 	m.log.Info(fmt.Sprintf("PUT %s: %s, result: %s", endpoint, data, res))
-	m.recordLock(res)
+	m.recordEdit(res)
 	return nil
 }
 
@@ -643,29 +643,20 @@ func lockedErr(res gjson.Result, err error) error {
 	return err
 }
 
-// recordLock keeps the edit session an in-place PUT opened: vManage answers
-// a PUT of an object an active policy uses with the processId of the session
-// (and the templates it affects), and holds the policy locked until it ends.
-func (m *sdwanManager) recordLock(res gjson.Result) {
-	if id := res.Get("processId").String(); m.inPlace && id != "" && !slices.Contains(m.locks, id) {
-		m.locks = append(m.locks, id)
+// recordEdit keeps the device templates an in-place PUT affects: vManage
+// answers a PUT of an object an active policy uses with the edit session
+// (processId) and the templates that must be pushed to apply the edit
+// (masterTemplatesAffected, the vSmarts' template), and holds the policy
+// locked until they are.
+func (m *sdwanManager) recordEdit(res gjson.Result) {
+	if !m.inPlace {
+		return
 	}
-}
-
-// releaseLocks ends the edit sessions of the in-place PUTs. A failure is
-// logged only: the next edit then finds the policy locked, and applies its
-// change with a cycle, which ends the session.
-func (m *sdwanManager) releaseLocks() {
-	for _, id := range m.locks {
-		endpoint := "/template/lock/" + id
-		res, err := m.client.Delete(endpoint)
-		if err != nil {
-			m.log.Error(err, fmt.Sprintf("DELETE %s, result: %s", endpoint, res))
-			continue
+	for _, t := range res.Get("masterTemplatesAffected").Array() {
+		if id := t.String(); id != "" && !slices.Contains(m.templates, id) {
+			m.templates = append(m.templates, id)
 		}
-		m.log.Info(fmt.Sprintf("DELETE %s: %s", endpoint, res))
 	}
-	m.locks = nil
 }
 
 type matchEntry struct {
@@ -779,6 +770,90 @@ func (m *sdwanManager) activateCentralPolicy() error {
 		return err
 	}
 	return m.waitTasksFinish()
+}
+
+// pushEdits applies the in-place edits: it pushes the device templates they
+// affect, as vManage does when a policy definition in use is edited, which
+// also ends the edit session; without affected templates it reactivates the
+// edited central policy.
+func (m *sdwanManager) pushEdits() error {
+	templates := m.templates
+	m.templates = nil
+	if len(templates) == 0 {
+		return m.pushCentralPolicy()
+	}
+	return m.pushTemplates(templates)
+}
+
+// pushTemplates pushes device templates with their current device inputs
+// (attachfeature with isEdited), and waits for the push task.
+func (m *sdwanManager) pushTemplates(templates []string) error {
+	list := []any{}
+	for _, tid := range templates {
+		res, err := m.client.Get("/template/device/config/attached/" + tid)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for _, d := range res.Get("data").Array() {
+			ids = append(ids, d.Get("uuid").String())
+		}
+		if len(ids) == 0 {
+			return fmt.Errorf("GET /template/device/config/attached/%s: no devices: %w", tid, errInvalidResponse)
+		}
+		body, err := json.Marshal(map[string]any{"templateId": tid, "deviceIds": ids, "isEdited": true, "isMasterEdited": false})
+		if err != nil {
+			return err
+		}
+		res, err = m.client.Post("/template/device/config/input", string(body))
+		if err != nil {
+			return err
+		}
+		var inputs []map[string]any
+		if err := json.Unmarshal([]byte(res.Get("data").Raw), &inputs); err != nil || len(inputs) == 0 {
+			return fmt.Errorf("POST /template/device/config/input %s: %w", tid, errInvalidResponse)
+		}
+		for _, in := range inputs {
+			in["csv-templateId"] = tid
+		}
+		list = append(list, map[string]any{"templateId": tid, "isEdited": true, "device": inputs})
+	}
+	body, err := json.Marshal(map[string]any{"deviceTemplateList": list})
+	if err != nil {
+		return err
+	}
+	endpoint := "/template/device/config/attachfeature"
+	res, err := m.client.Post(endpoint, string(body))
+	if err != nil {
+		return err
+	}
+	m.log.Info(fmt.Sprintf("POST %s: templates %v, result: %s", endpoint, templates, res))
+	id := res.Get("id").String()
+	if id == "" {
+		return fmt.Errorf("POST %s: %w", endpoint, errInvalidResponse)
+	}
+	return m.waitAction(id)
+}
+
+// waitAction waits until the vManage action id is done, for at most
+// taskWaitTimeout, and fails if it failed on a device.
+func (m *sdwanManager) waitAction(id string) error {
+	endpoint := "/device/action/status/" + id
+	deadline := time.Now().Add(m.taskWaitTimeout)
+	for {
+		res, err := m.client.Get(endpoint)
+		if err == nil && res.Get("summary.status").String() == "done" {
+			m.log.Info(fmt.Sprintf("GET %s: %s", endpoint, res.Get("summary")))
+			if n := res.Get("summary.count.Failure").Int(); n > 0 {
+				return fmt.Errorf("%s: failed on %d device(s): %s", endpoint, n, res.Get("summary"))
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("vManage action %s not done within %s (last error: %v)", id, m.taskWaitTimeout, err)
+		}
+		time.Sleep(m.taskPollInterval)
+	}
 }
 
 // pushCentralPolicy pushes the edited objects of the active central policy
