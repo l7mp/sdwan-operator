@@ -63,6 +63,22 @@ helm install sdwan-operator sdwan-operator/sdwan-operator \
 kubectl get pods -n sdwan-operator
 ```
 
+### Annotate a Service
+
+`policy.sdwan.cisco.com/tunnel: <colors>` routes a Service's endpoints over
+those vManage colors: the operator writes two app-route sequences per Service
+port (to and from its endpoints) whose action pins the colors as the backup
+SLA preferred color (`demo/service-business.yaml`).
+
+`policy.sdwan.cisco.com/sla-class: <name>`, next to the tunnel annotation,
+makes the sequences steer by an existing vManage SLA class instead, with the
+tunnel as the preferred color: the edges keep the flow on it while it meets
+the class and move it to another color that does when it does not, as fast as
+their app-route (or enhanced app-route) timers allow. The class must exist in
+vManage (Configuration > Policies > Lists > SLA Class); a change naming a class
+vManage does not have fails and is retried. Removing the annotation pins the
+tunnel again.
+
 ## Blog Post
 
 This project was featured in the CNCF blog post [Connecting distributed Kubernetes with Cilium and SD-WAN: Building an intelligent network fabric](https://www.cncf.io/blog/2025/10/25/connecting-distributed-kubernetes-with-cilium-and-sd-wan-building-an-intelligent-network-fabric/).
