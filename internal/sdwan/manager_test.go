@@ -98,6 +98,8 @@ type fakeVManage struct {
 	// editResponse is the answer to the PUT being served, if it opened an
 	// edit session.
 	editResponse string
+	// slaLists maps the names of the SLA class lists to their ids.
+	slaLists map[string]string
 }
 
 const loginPage = "<html><head><title>Cisco vManage</title></head><body>login</body></html>"
@@ -275,6 +277,13 @@ func (f *fakeVManage) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		data, _ := json.Marshal(lists)
 		_, _ = fmt.Fprintf(w, `{"data":%s}`, data)
+	case r.Method == http.MethodGet && path == "/template/policy/list/sla":
+		lists := []map[string]any{}
+		for name, id := range f.slaLists {
+			lists = append(lists, map[string]any{"name": name, "listId": id, "type": "sla"})
+		}
+		data, _ := json.Marshal(lists)
+		_, _ = fmt.Fprintf(w, `{"data":%s}`, data)
 	case r.Method == http.MethodGet && path == "/template/policy/definition/approute":
 		if f.noApproute {
 			_, _ = fmt.Fprint(w, `{"data":[]}`)
@@ -395,7 +404,7 @@ func (f *fakeVManage) addLegacyList(t *testing.T, name, id string) {
 	defer f.mu.Unlock()
 	f.dataPrefixLists[name] = id
 	for i, direction := range []string{"source", "destination"} {
-		rule, err := generateSeqRule(100+i, direction, id, "80", "6", "mpls")
+		rule, err := generateSeqRule(100+i, direction, id, "80", "6", "mpls", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -863,6 +872,88 @@ func TestUpsertSendsValidApproute(t *testing.T) {
 		if got := seq.Get(`match.entries.#(field=="protocol").value`).String(); got != "6" {
 			t.Fatalf("sequence %d protocol = %q", i, got)
 		}
+	}
+}
+
+// With an SLA class the sequences steer by it, preferring the tunnel; without
+// one they pin the tunnel. The SLA class lists are read only when a change
+// names a class.
+func TestUpsertWithSLAClass(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.slaLists = map[string]string{"InferenceSLA": "sla-1"}
+	m := newTestManager(t, ts.URL)
+
+	c := Change{Namespace: "default", Name: "app", Endpoints: []string{"10.0.0.1"}, TargetPort: 8080, Protocol: "TCP",
+		Tunnel: "public-internet", SLAClass: "InferenceSLA"}
+	if err := m.Apply([]Change{c})[0]; err != nil {
+		t.Fatal(err)
+	}
+	seqs := gjson.Get(f.approuteDefinition(), "sequences").Array()
+	if len(seqs) != 2 {
+		t.Fatalf("expected 2 sequences, got %s", f.approuteDefinition())
+	}
+	for i, seq := range seqs {
+		if got := seq.Get("actions.0.type").String(); got != "slaClass" {
+			t.Fatalf("sequence %d action = %q", i, got)
+		}
+		if got := seq.Get(`actions.0.parameter.#(field=="name").ref`).String(); got != "sla-1" {
+			t.Fatalf("sequence %d SLA class ref = %q", i, got)
+		}
+		if got := seq.Get(`actions.0.parameter.#(field=="preferredColor").value`).String(); got != "public-internet" {
+			t.Fatalf("sequence %d preferred color = %q", i, got)
+		}
+	}
+
+	// the same change again needs no update, and dropping the class pins the
+	// tunnel again
+	_, before := f.state()
+	if err := m.Apply([]Change{c})[0]; err != nil {
+		t.Fatal(err)
+	}
+	if _, calls := f.state(); slices.Contains(calls[len(before):], "PUT /template/policy/definition/approute/ar-1") {
+		t.Fatalf("unchanged SLA class rewrote the approute: %q", calls[len(before):])
+	}
+	c.SLAClass = ""
+	_, before = f.state()
+	if err := m.Apply([]Change{c})[0]; err != nil {
+		t.Fatal(err)
+	}
+	_, calls := f.state()
+	if slices.Contains(calls[len(before):], "GET /template/policy/list/sla") {
+		t.Fatalf("SLA class lists read without a class: %q", calls[len(before):])
+	}
+	if got := gjson.Get(f.approuteDefinition(), "sequences.0.actions.0.type").String(); got != "backupSlaPreferredColor" {
+		t.Fatalf("action after dropping the class = %q", got)
+	}
+}
+
+// A class vManage does not have fails the change before the central policy is
+// touched, with an error that is retried (the class may be created later),
+// and leaves the other changes of the batch alone.
+func TestUpsertWithUnknownSLAClass(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	f.slaLists = map[string]string{"InferenceSLA": "sla-1"}
+	m := newTestManager(t, ts.URL)
+
+	errs := m.Apply([]Change{
+		{Namespace: "default", Name: "a", Endpoints: []string{"10.0.0.1"}, TargetPort: 8080, Protocol: "TCP",
+			Tunnel: "public-internet", SLAClass: "Missing"},
+		{Namespace: "default", Name: "b", Endpoints: []string{"10.0.0.2"}, TargetPort: 8080, Protocol: "TCP",
+			Tunnel: "biz-internet"},
+	})
+	if errs[0] == nil || errors.Is(errs[0], ErrInvalidSpec) {
+		t.Fatalf("expected a retryable error for the unknown class, got %v", errs[0])
+	}
+	if errs[1] != nil {
+		t.Fatalf("other change failed: %v", errs[1])
+	}
+	if _, ok := f.lists()["default___a"]; ok {
+		t.Fatalf("list created for a change that failed")
+	}
+	if n := len(gjson.Get(f.approuteDefinition(), "sequences").Array()); n != 2 {
+		t.Fatalf("expected the other change's 2 sequences, got %s", f.approuteDefinition())
 	}
 }
 
@@ -1483,13 +1574,13 @@ func TestUnchangedPolicyNeedsNoCycle(t *testing.T) {
 func TestSameSequences(t *testing.T) {
 	t.Parallel()
 	rule := func(id int, tunnel string) string {
-		r, err := generateSeqRule(id, "source", "dp-1", "8080", "6", tunnel)
+		r, err := generateSeqRule(id, "source", "dp-1", "8080", "6", tunnel, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		return r
 	}
-	dst, err := generateSeqRule(2, "destination", "dp-1", "8080", "6", "mpls")
+	dst, err := generateSeqRule(2, "destination", "dp-1", "8080", "6", "mpls", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1762,5 +1853,19 @@ func TestLockedIsNotRejected(t *testing.T) {
 	err := lockedErr(gjson.Parse(`{"error":{"code":"POLICY0013","details":"locked"}}`), errors.New("HTTP Request failed: StatusCode 400"))
 	if !errors.Is(err, errPolicyLocked) || rejected(err) {
 		t.Fatalf("locked error %v: errPolicyLocked %v, rejected %v", err, errors.Is(err, errPolicyLocked), rejected(err))
+	}
+}
+
+func TestUpsertRejectsInvalidSLAClass(t *testing.T) {
+	t.Parallel()
+	f, ts := newFakeVManage(t)
+	m := newTestManager(t, ts.URL)
+	err := m.Apply([]Change{{Namespace: "default", Name: "app", Endpoints: []string{"10.0.0.1"}, TargetPort: 8080,
+		Protocol: "TCP", Tunnel: "public-internet", SLAClass: `x"}]`}})[0]
+	if !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("expected ErrInvalidSpec, got %v", err)
+	}
+	if _, calls := f.state(); len(calls) != 0 {
+		t.Fatalf("vManage called for an invalid SLA class: %q", calls)
 	}
 }

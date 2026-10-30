@@ -603,3 +603,22 @@ func TestRunShutdownIgnoresStopError(t *testing.T) {
 		t.Fatal("start failure not reported")
 	}
 }
+
+func TestParseSLAClass(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		spec    map[string]interface{}
+		want    string
+		wantErr bool
+	}{
+		{"missing", map[string]interface{}{}, "", false},
+		{"null", map[string]interface{}{"slaClass": nil}, "", false},
+		{"set", map[string]interface{}{"slaClass": "InferenceSLA"}, "InferenceSLA", false},
+		{"not a string", map[string]interface{}{"slaClass": int64(5)}, "", true},
+	} {
+		got, err := parseSLAClass(tc.spec)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("%s: got %q, %v; want %q, error %v", tc.name, got, err, tc.want, tc.wantErr)
+		}
+	}
+}

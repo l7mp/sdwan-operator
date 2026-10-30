@@ -75,6 +75,9 @@ var ErrInvalidSpec = errors.New("invalid tunnel policy")
 // parameter of the backupSlaPreferredColor action.
 var tunnelRe = regexp.MustCompile(`^[a-z0-9-]+( [a-z0-9-]+)*$`)
 
+// slaClassRe matches the name of a vManage SLA class list.
+var slaClassRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
 // protocolNumbers maps the protocols of a Kubernetes Service to IP protocol
 // numbers.
 var protocolNumbers = map[string]int32{
@@ -92,6 +95,11 @@ type Change struct {
 	TargetPort      int64
 	Protocol        string
 	Tunnel          string
+	// SLAClass, if set, names a vManage SLA class: the sequences then steer
+	// by it, with the tunnel as the preferred color, so that the edges move
+	// the flow off the tunnel while it misses the class, instead of pinning
+	// it there as the backup color.
+	SLAClass string
 }
 
 type Manager interface {
@@ -143,7 +151,7 @@ func (m *nullManager) Apply(changes []Change) []error {
 	errs := make([]error, len(changes))
 	for i, c := range changes {
 		if !c.Delete {
-			_, _, errs[i] = checkUpsert(c.Endpoints, c.Protocol, c.Tunnel)
+			_, _, errs[i] = checkUpsert(c.Endpoints, c.Protocol, c.Tunnel, c.SLAClass)
 		}
 	}
 	return errs
@@ -212,6 +220,40 @@ func (m *sdwanManager) refreshCache() error {
 	return nil
 }
 
+// resolveSLAClasses sets the list id of the SLA class of each update that
+// names one, reading the SLA class lists only if one does. An update whose
+// class vManage does not have fails, and is left out of the returned updates:
+// the class may be created later, so the error is retried.
+func (m *sdwanManager) resolveSLAClasses(updates []*update, errs []error) ([]*update, error) {
+	if !slices.ContainsFunc(updates, func(u *update) bool { return !u.delete() && u.slaClass != "" }) {
+		return updates, nil
+	}
+	const endpoint = "/template/policy/list/sla"
+	res, err := m.client.Get(endpoint)
+	if err != nil {
+		return updates, err
+	}
+	data := res.Get("data")
+	if !data.IsArray() {
+		return updates, fmt.Errorf("GET %s: %w", endpoint, errInvalidResponse)
+	}
+	ids := make(map[string]string)
+	for _, val := range data.Array() {
+		ids[val.Get("name").String()] = val.Get("listId").String()
+	}
+	kept := updates[:0:0]
+	for _, u := range updates {
+		if !u.delete() && u.slaClass != "" {
+			if u.slaClassID = ids[u.slaClass]; u.slaClassID == "" {
+				errs[u.idx] = fmt.Errorf("SLA class %q not found in vManage", u.slaClass)
+				continue
+			}
+		}
+		kept = append(kept, u)
+	}
+	return kept, nil
+}
+
 // update is a change that passed the checks, with what vManage needs for it.
 type update struct {
 	// idx is the index of the change in the batch.
@@ -223,6 +265,9 @@ type update struct {
 	listData            string
 	prefixes            []string
 	port, proto, tunnel string
+	// slaClass is the SLA class the sequences steer by, "" to pin the
+	// tunnel, and slaClassID its list id.
+	slaClass, slaClassID string
 	// listID and legacyID are the ids of the object's list and of its list
 	// from before names were hashed, "" if it has none.
 	listID, legacyID string
@@ -244,7 +289,7 @@ func (m *sdwanManager) prepare(c Change) (*update, error) {
 		return u, nil
 	}
 
-	ipv4, protoNum, err := checkUpsert(c.Endpoints, c.Protocol, c.Tunnel)
+	ipv4, protoNum, err := checkUpsert(c.Endpoints, c.Protocol, c.Tunnel, c.SLAClass)
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +312,7 @@ func (m *sdwanManager) prepare(c Change) (*update, error) {
 	u.port = strconv.Itoa(int(c.TargetPort))
 	u.proto = strconv.Itoa(int(protoNum))
 	u.tunnel = c.Tunnel
+	u.slaClass = c.SLAClass
 	return u, nil
 }
 
@@ -305,6 +351,10 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 	if !ok {
 		return fail(errors.New("fail to get approute"), updates)
 	}
+	updates, err := m.resolveSLAClasses(updates, errs)
+	if err != nil {
+		return fail(err, updates)
+	}
 
 	var changed []*update
 	for _, u := range updates {
@@ -326,7 +376,7 @@ func (m *sdwanManager) Apply(changes []Change) []error {
 
 	// No sequence uses a new list yet: create it before the central policy
 	// is deactivated, to keep the time without a policy short.
-	changed, err := m.upsertLists(changed, true, errs)
+	changed, err = m.upsertLists(changed, true, errs)
 	if err != nil {
 		return fail(err, changed)
 	}
@@ -579,7 +629,7 @@ func replaceSequences(def string, updates []*update) (string, bool, error) {
 			continue
 		}
 		for _, direction := range []string{"source", "destination"} {
-			rule, err := generateSeqRule(sid, direction, u.listID, u.port, u.proto, u.tunnel)
+			rule, err := generateSeqRule(sid, direction, u.listID, u.port, u.proto, u.tunnel, u.slaClassID)
 			if err != nil {
 				return "", false, err
 			}
@@ -667,8 +717,16 @@ type matchEntry struct {
 }
 
 type seqAction struct {
-	Type      string `json:"type"`
-	Parameter string `json:"parameter"`
+	Type string `json:"type"`
+	// Parameter is the color of a backupSlaPreferredColor action, and the
+	// fields of an slaClass action.
+	Parameter any `json:"parameter"`
+}
+
+type actionField struct {
+	Field string `json:"field"`
+	Ref   string `json:"ref,omitempty"`
+	Value string `json:"value,omitempty"`
 }
 
 type seqRule struct {
@@ -684,8 +742,9 @@ type seqRule struct {
 
 // generateSeqRule returns the approute sequence that sends the traffic from
 // (direction "source") or to (direction "destination") the endpoints of a
-// dataprefix list over the tunnel.
-func generateSeqRule(id int, direction, dataPrefixList, port, proto, tunnel string) (string, error) {
+// dataprefix list over the tunnel: pinned to it as the backup color, or, with
+// an SLA class list id, preferring it while it meets the class.
+func generateSeqRule(id int, direction, dataPrefixList, port, proto, tunnel, slaClassID string) (string, error) {
 	r := seqRule{
 		SequenceID:     id,
 		SequenceName:   "App Route",
@@ -698,6 +757,10 @@ func generateSeqRule(id int, direction, dataPrefixList, port, proto, tunnel stri
 		{Field: "protocol", Value: proto},
 	}
 	r.Actions = []seqAction{{Type: "backupSlaPreferredColor", Parameter: tunnel}}
+	if slaClassID != "" {
+		r.Actions = []seqAction{{Type: "slaClass", Parameter: []actionField{
+			{Field: "name", Ref: slaClassID}, {Field: "preferredColor", Value: tunnel}}}}
+	}
 	b, err := json.Marshal(r)
 	return string(b), err
 }
@@ -718,7 +781,7 @@ type prefixList struct {
 // The approute sequences match IPv4 only, so the IPv6 endpoints of a
 // dual-stack service are left out. Without IPv4 endpoints the upsert removes
 // the service's list, so the other fields are not checked then.
-func checkUpsert(endpoints []string, protocol, tunnel string) ([]string, int32, error) {
+func checkUpsert(endpoints []string, protocol, tunnel, slaClass string) ([]string, int32, error) {
 	ipv4 := make([]string, 0, len(endpoints))
 	for _, val := range endpoints {
 		addr, err := netip.ParseAddr(val)
@@ -735,6 +798,9 @@ func checkUpsert(endpoints []string, protocol, tunnel string) ([]string, int32, 
 
 	if !tunnelRe.MatchString(tunnel) {
 		return nil, 0, fmt.Errorf("%w: tunnel %q is not a list of vManage colors", ErrInvalidSpec, tunnel)
+	}
+	if slaClass != "" && !slaClassRe.MatchString(slaClass) {
+		return nil, 0, fmt.Errorf("%w: SLA class %q is not a vManage list name", ErrInvalidSpec, slaClass)
 	}
 	protoNum, ok := protocolNumbers[protocol]
 	if !ok {

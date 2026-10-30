@@ -43,12 +43,15 @@ const (
 	SDWANOperatorSpec               = "artifacts/endpoints-controller-spec.yaml"
 	SDWANOperatorGatherSpec         = "artifacts/endpoints-controller-gather-spec.yaml"
 	SDWANPolicyTunnelAnnotationName = "policy.sdwan.cisco.com/tunnel"
-	SDWANConfigFile                 = "vmanage-config.yaml"
-	apiServerPort                   = 8443
-	maxPort                         = 65535
-	tunnelPolicyKind                = "TunnelPolicyView"
-	retryBaseDelay                  = time.Second
-	retryMaxDelay                   = 5 * time.Minute
+	// SDWANPolicySLAClassAnnotationName names a vManage SLA class: the
+	// Service's tunnel becomes its preferred color (see sdwan.Change).
+	SDWANPolicySLAClassAnnotationName = "policy.sdwan.cisco.com/sla-class"
+	SDWANConfigFile                   = "vmanage-config.yaml"
+	apiServerPort                     = 8443
+	maxPort                           = 65535
+	tunnelPolicyKind                  = "TunnelPolicyView"
+	retryBaseDelay                    = time.Second
+	retryMaxDelay                     = 5 * time.Minute
 	// maxAttempts is the number of attempts of a change before giving up.
 	maxAttempts = 10
 	// batchDelay is how long a batch waits for more changes after the first
@@ -328,9 +331,13 @@ func (r *policyController) currentChange(ctx context.Context, key types.Namespac
 	if err != nil {
 		return sdwan.Change{}, fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
 	}
+	slaClass, err := parseSLAClass(spec)
+	if err != nil {
+		return sdwan.Change{}, fmt.Errorf("%w: %w", sdwan.ErrInvalidSpec, err)
+	}
 
 	return sdwan.Change{Namespace: key.Namespace, Name: key.Name, Endpoints: endpoints,
-		TargetPort: port, Protocol: protocol, Tunnel: tunnel}, nil
+		TargetPort: port, Protocol: protocol, Tunnel: tunnel, SLAClass: slaClass}, nil
 }
 
 // finish ends an attempt to apply a tunnel policy. A policy that failed is
@@ -390,6 +397,20 @@ func parseSpec(spec map[string]interface{}) (port int64, protocol, tunnel string
 	}
 
 	return port, protocol, tunnel, endpoints, nil
+}
+
+// parseSLAClass returns the optional SLA class of a spec, "" if it has none:
+// the pipeline projects a missing annotation as a missing or null field.
+func parseSLAClass(spec map[string]interface{}) (string, error) {
+	val, ok, err := unstructured.NestedFieldNoCopy(spec, "slaClass")
+	if err != nil || !ok || val == nil {
+		return "", err
+	}
+	name, isString := val.(string)
+	if !isString {
+		return "", fmt.Errorf("unable to parse slaClass from spec: expected string, got %T", val)
+	}
+	return name, nil
 }
 
 // getTargetPort returns the target port of a spec. A Service gives it as a

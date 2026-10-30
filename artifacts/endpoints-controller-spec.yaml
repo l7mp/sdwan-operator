@@ -18,6 +18,7 @@ controllers:
             serviceName: $.metadata.name
             type: $.spec.type
             tunnel: '$["metadata"]["annotations"]["policy.sdwan.cisco.com/tunnel"]'
+            slaClass: '$["metadata"]["annotations"]["policy.sdwan.cisco.com/sla-class"]'
             ports: $.spec.ports
       - "@unwind": $.spec.ports
       - "@project":
@@ -26,6 +27,7 @@ controllers:
             type: $.spec.type
             serviceName: $.spec.serviceName
             tunnel: $.spec.tunnel
+            slaClass: $.spec.slaClass
             port: $.spec.ports.port
             protocol: $.spec.ports.protocol
             targetPort: $.spec.ports.targetPort
